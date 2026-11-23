@@ -1,0 +1,884 @@
+---
+title: "chap4preprocess"
+output: html_document
+date: "2025-05-01"
+---
+
+```{r}
+setwd("/Users/madelina/Desktop/Chapter 4")
+getwd()
+
+```
+
+```{r}
+# Installing/loading packages
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+# Installing dada2 package from CRAN
+install.packages("dada2", dependencies = TRUE)
+```
+
+```{r}
+# Loading dada2 package
+library(dada2)
+
+# Checking the installed version of dada2
+packageVersion("dada2")
+```
+
+```{r}
+library(ShortRead)
+library(dada2)
+library(Rcpp)
+```
+
+1. STARTED A NEW PROJECT 
+Overall, this code checks for the existence of a directory named fastqfiles in the current working directory. If the directory does not exist, it creates it and informs the user. If it does exist, it simply informs the user that the directory is already there. This is a common practice in R programming to ensure that the necessary directories are available for data storage or processing.
+```{r}
+# Checking Current Working Directory
+print(getwd())
+
+# Defining Path Relative to Current Directory
+path <- "fastqfiles/" 
+
+# Checking if Path Exists
+if (!file.exists(path)) {
+  # Creating Directory if it doesn't exist
+  dir.create(path)
+  print(paste("Created directory:", path))
+} else {
+  print(paste("Directory already exists:", path))
+}
+```
+
+2. Generates sorted lists of filenames - lists them by R1 & R2
+path: the directory containing the file path
+pattern: selecting files that contain that in their name
+sort: putting these files in alphabetically and stored in fnFs & fnRs
+```{r}
+fnFs <- sort(list.files(path, pattern = "_R1_16S_final.fastq", full.names = TRUE))
+
+fnRs <- sort(list.files(path, pattern = "_R2_16S_final.fastq", full.names = TRUE))
+```
+
+
+3. This is used to generate the list of sample names by extracting the 1st, 2nd & 3rd parts of the file name (this is more parts than usual but we have multiple experiments for this chapter, so it's fine)
+
+```{r}
+get.sample.name <- function(fname) {
+  parts <- strsplit(basename(fname), "_")[[1]]
+  parts[1:3]
+}
+
+sample.names <- unname(sapply(fnFs, get.sample.name))
+```
+
+```{r}
+print(sample.names)
+```
+```{r}
+print(fnFs)
+```
+
+```{r}
+print(fnRs)
+```
+5. identifying primers and all orientations of primers 
+```{r}
+FWD <- "GTGYCAGCMGCCGCGGTAA"  
+REV <- "GGACTACNVGGGTWTCTAAT"  
+```
+
+This is creating all orientations of the primers
+```{r}
+allOrients <- function(primer) {
+  require(Biostrings)
+  dna <- DNAString(primer)  # The Biostrings works w/ DNAString objects rather than character vectors
+  orients <- c(Forward = dna, Complement = complement(dna), Reverse = reverse(dna), 
+               RevComp = reverseComplement(dna))
+  return(sapply(orients, toString))  # Convert back to character vector
+}
+FWD.orients <- allOrients(FWD)
+REV.orients <- allOrients(REV)
+FWD.orients
+REV.orients
+
+```
+
+6. Filters and trims the original fastq files (fnFs and fnRs), removes reads with too many ambiguous bases (N's), and saves the filtered files in a subdirectory named "filtN" within the original directory. --so my filtN will be within fastqfiles folder in my CH1 Working directory
+
+*it takes a long time ~ about 30 mins - can see files being created in the FiltN folder??
+```{r}
+fnFs.filtN <- file.path(path, "filtN", basename(fnFs)) # Put N-filtered files in filtN/ subdirectory
+fnRs.filtN <- file.path(path, "filtN", basename(fnRs))
+filterAndTrim(fnFs, fnFs.filtN, fnRs, fnRs.filtN, maxN = 0, multithread = TRUE, compress=TRUE)
+```
+
+
+
+7. Double check: Looking for hits of primers in any orientation
+*we want this to be 0 ~ if not then we cut the sequences with the primers!
+yay no primers!!
+```{r}
+primerHits <- function(primer, fn) {
+  # Counts number of reads in which the primer is found
+  nhits <- vcountPattern(primer, sread(readFastq(fn)), fixed = FALSE)
+  return(sum(nhits > 0))
+}
+
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs.filtN[[4]]), 
+      FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fnRs.filtN[[4]]), 
+      REV.ForwardReads = sapply(REV.orients, primerHits, fn = fnFs.filtN[[4]]), 
+      REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs.filtN[[4]]))
+```
+YAY! 
+
+8. TIME TO VISUALIZE THE RAW DATA!! QC plots
+a. Looking at quality profile R1 reads, first 25 samples*** 132 total 
+You are looking at where the line on the graphs begin to plummet (this is where the quality of the reads goes down) we want to cut prior to where the quality goes down. You should look at every single sample.
+
+```{r}
+plotQualityProfile(fnFs.filtN[c(1:25)]) 
+```
+```{r}
+plotQualityProfile(fnFs.filtN[c(25:50)]) 
+```
+```{r}
+plotQualityProfile(fnFs.filtN[c(50:75)]) 
+```
+
+
+```{r}
+plotQualityProfile(fnFs.filtN[c(75:100)]) 
+```
+```{r}
+plotQualityProfile(fnFs.filtN[c(100:132)]) 
+```
+
+```{r}
+plotQualityProfile(fnRs.filtN[c(1:132)])
+```
+**will truncate at 220 
+
+This next step takes a while ...  20-30 mins? 
+This is trimming based on quality profile plots cut off & uploading new, trimmed files into a folder (called trimmed) - to check if code is working look for files popping up in the new trimmed folder 
+
+truncLen=c(210,210), #specifies where to be truncated - leaves plenty of overlap
+maxN=0, #DADA does not allow ambiguous(N) bases, so 0 
+maxEE=c(2,2), #allow 2 expected errors in a read (for both forward & reverse reads)
+truncQ=2, #trims low quality bases from the ends of their reads (2 is threshold)
+rm.phix=TRUE, #remove reads matching phiX genome
+matchIDs=TRUE, #enforce matching between id-line sequence identifiers of F and R reads
+compress=TRUE, multithread=TRUE) #On Windows set multithread=FALSE
+
+```{r}
+print(fnFs)
+print(fnRs)
+print(filtFs)
+print(filtRs)
+
+```
+
+SHOULD ALL MATCH LENGTH ~ IF NOT MAY NEED TO CHANGE SAMPLE NAMES SO NO REPEATS
+```{r}
+length(fnFs)
+length(fnRs)
+length(sample.names)
+length(filtFs)
+length(filtRs)
+
+```
+
+
+```{r}
+
+
+# List forward and reverse read files
+fnFs <- sort(list.files(path, pattern="_R1_16S_final.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_16S_final.fastq", full.names = TRUE))
+
+# Extract sample names - since multiple names that could be repetitive, had to be more distinct with the naming  
+sample.names <- sapply(strsplit(basename(fnFs), "_R1_"), `[`, 1)
+
+# Create output directory
+filt_path <- file.path(path, "trimmed")
+if(!dir.exists(filt_path)) dir.create(filt_path)
+
+# Construct output file paths
+filtFs <- file.path(filt_path, paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(filt_path, paste0(sample.names, "_R_filt.fastq.gz"))
+
+# Run filterAndTrim
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, 
+                     truncLen = c(220, 220),
+                     maxN = 0,
+                     maxEE = c(2, 2),
+                     truncQ = 2,
+                     rm.phix = TRUE,
+                     matchIDs = TRUE,
+                     compress = TRUE,
+                     multithread = TRUE)  # Use FALSE on Windows
+
+# Check and export results
+head(out)
+tail(out)
+write.csv(out, file = "out.csv", row.names = TRUE, quote = FALSE)
+
+```
+                                  reads.in reads.out
+Mat_10P_TCATTC_R1_16S_final.fastq   107619     91783
+Mat_11P_TCATTC_R1_16S_final.fastq   103746     89191
+Mat_12P_TCATTC_R1_16S_final.fastq   103514     88873
+Mat_13P_TCATTC_R1_16S_final.fastq    77284     66084
+Mat_14P_TCATTC_R1_16S_final.fastq   123187    106700
+Mat_15P_TCATTC_R1_16S_final.fastq   132700    114627
+                              reads.in reads.out
+MM_TEMP_H4_R1_16S_final.fastq    89087     65073
+MM_TEMP_H5_R1_16S_final.fastq    86312     62875
+MM_TEMP_H6_R1_16S_final.fastq    91556     66342
+MM_TEMP_H7_R1_16S_final.fastq    90742     66489
+MM_TEMP_H8_R1_16S_final.fastq    58641     42126
+MM_TEMP_H9_R1_16S_final.fastq    99970     73295
+
+
+10. LEARNING ERROR RATES NEXT 
+Error rates typically range from .1%-1% per base pair sequence 
+Types of potential errors: PCR errors, sequencing errors, chimeric reads, contaminants
+This step is checking for the rates of errors in the reads
+It sets an option in the DADA2 pipeline to allow up to 30 iterations during the error rate consistency estimation step
+```{r}
+setDadaOpt(MAX_CONSIST=30) #increase number of cycles to allow convergence
+```
+
+This will take 40 mins
+```{r}
+errF <- learnErrors(filtFs, multithread=TRUE) 
+errR <- learnErrors(filtRs, multithread=TRUE)
+```
+122596760 total bases in 557258 reads from 6 samples will be used for learning the error rates.
+122596760 total bases in 557258 reads from 6 samples will be used for learning the error rates.
+
+11. Visualizing estimated error rates
+- error rates should decline with increasing qual score
+- the red line is based on definition of quality score alone
+- theblack line is estimated error rate after convergence
+- dots are observed error rate for each quality score
+- you want the black dots to roughly fall along the black line 
+
+```{r}
+plotErrors(errF, nominalQ=TRUE) 
+plotErrors(errR, nominalQ=TRUE) 
+```
+*Everything looks reasonable (no strong deviations from black lines and black points), so we proceed with confidence
+
+12. Deplicate Reads: 
+
+-  Dereplication in bioinformatics means grouping identical DNA sequences together and counting how many times each sequence appears. This helps speed up the analysis by avoiding repeating the same calculations for identical sequences : For example, if you have 100 copies of the same sequence, instead of treating each copy separately, dereplication counts it as one sequence with an abundance of 100.
+
+- In DADA2 it keeps track of the quality (or reliability) of each unique sequence. It calculates an average quality score for each sequence by considering the quality scores of all the copies. 
+
+-This helps DADA2 make fewer mistakes when it tries to figure out the true sequences from the noisy data generated by sequencing machines.
+*DADA2's denoising step can more effectively distinguish between true biological variants and sequencing artifacts
+
+- In simple terms, dereplication helps bioinformatics tools work faster by grouping identical sequences together, and DADA2 uses quality information to make better guesses about the real DNA sequences
+
+MEMORY VECTOR REACHED ON LOCAL COMPUTER: 
+
+~~~ UPDATED FINAL CODE FOR UNC R SERVER ~ on demand, interactive, R server, start a session and ran this code ~ first put "trimmed" folder on my working directory (/proj/mccoy/Maddy)
+
+*INCREASED MEMORY TO 30 TO PREVENT CRASHING! 10 hours for each session! 
+
+#install necessary packages 
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install("dada2")
+library(dada2)
+
+> path <- "/proj/mccoylab/Maddy"
+
+> filt_path <- file.path(path, "trimmed")
+
+> print(filt_path)
+[1] "/proj/mccoylab/Maddy/trimmed"
+
+
+# Get the sample names (using the first 3 underscore-separated parts)
+sample.names2 <- sapply(
+  strsplit(basename(list.files(filt_path, pattern="filt.fastq.gz", full.names=TRUE)), "_"),
+  function(x) paste(x[1:3], collapse = "_")
+)
+sample.names2 <- unique(sample.names2)
+
+# Construct the file paths for forward and reverse reads
+filtFs <- file.path(filt_path, paste0(sample.names2, "_F_filt.fastq.gz"))
+filtRs <- file.path(filt_path, paste0(sample.names2, "_R_filt.fastq.gz"))
+
+# Check the file lists
+print(filtFs)
+print(filtRs)
+
+# Dereplicate ~ this takes a few minutes, be patient! 
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+
+#Saving ~ this takes a few minutes
+saveRDS(derepFs, file = "derepFs.rds")
+saveRDS(derepRs, file = "derepRs.rds")
+
+
+#reload onto this script! ~ check to make sure the correct F files are corresponding with derepFs and R files are corresponding with derepRs
+derepFs <- readRDS("derepFs.rds")
+derepRs <- readRDS("derepRs.rds")
+
+*will have to continue on server due to not enough memory!!!
+
+loading error rates into server since already found here on local 
+```{r}
+saveRDS(errF, file = "errF.rds")
+saveRDS(errR, file = "errR.rds")
+```
+
+Server script for dadaFs & dadaRs!!!
+
+*working directory is /proj/mccoylab/Maddy 
+*trimmed files were uploaded to working directory prior, as well as dereplicated files (derepFs/derepRs) and error rates pulled from local directory (errF/errR)
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install("dada2")
+library(dada2)
+
+path <- "/proj/mccoylab/Maddy"
+
+filt_path <- file.path(path, "trimmed")
+
+print(filt_path)
+ 
+sample.names2 <- sapply(
+  strsplit(basename(list.files(filt_path, pattern="filt.fastq.gz", full.names=TRUE)), "_"),
+  function(x) paste(x[1:3], collapse = "_")
+)
+sample.names2 <- unique(sample.names2)
+
+filtFs <- file.path(filt_path, paste0(sample.names2, "_F_filt.fastq.gz"))
+filtRs <- file.path(filt_path, paste0(sample.names2, "_R_filt.fastq.gz"))
+
+
+derepFs <- readRDS("derepFs.rds")
+derepRs <- readRDS("derepRs.rds")
+
+errF <- readRDS("errF.rds")
+errR <- readRDS("errR.rds")
+
+*****takes 3-4hours EACH ~ make sure to save as a rds after and have enough time on server to run these! 
+
+~started run at 3:15pm, ended at 7:15 pm 
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+samples will pop up below one at a time
+
+saveRDS(dadaFs, file = "dadaFs.rds") ~ saved to wd local and on demand
+
+
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+samples will pop up below one at a time
+
+saveRDS(dadaRs, file = "dadaRs.rds") ~ saved to wd local and on demand
+
+uploading dadaFs & dadaRs also takes a few hours each! 
+
+output from dadaFs/
+dadaFs[[1]]
+dada-class: object describing DADA2 denoising results
+1823 sequence variants were inferred from 37522 input unique sequences.
+Key parameters: OMEGA_A = 1e-40, OMEGA_C = 1e-40, BAND_SIZE = 16
+dadaRs[[1]]
+dada-class: object describing DADA2 denoising results
+1824 sequence variants were inferred from 37047 input unique sequences.
+Key parameters: OMEGA_A = 1e-40, OMEGA_C = 1e-40, BAND_SIZE = 16
+
+
+mergers output:
+sequence
+1  GACGGAGGATGCAAGTGTTATCCGGAATCACTGGGCGTAAAGCGTCTGTAGGTGGTTTACTAAGTCAACTGTTAAATCTTGAAGCTCAACTTCAAAATCGCAGTCGAAACTAGTAGACTAGAGTATAGTAGGGGTAAAGGGAATTTCCAGTGGAGCGGTGAAATGCGTAGAGATTGGAAAGAACACCGATGGCGAAGGCACTTTACTGGGCTATTACTGACACTCAGAGACGAAAGCTAGGGTAGCAAATGGG
+2  TACGGAGGAGGCAAGCGTTATCCGGAATTATTGGGCGTAAAGCGTCCGCAGGTGGCGATTCAAGTCTGCTGTCAAAGCACGGGGCTTAACTCCGTTAAGGCAGTGGAAACTGAATAGCTAGAGTGCCGTAGGGGTAGAGGGAATTCCCGGTGTAGCGGTGAAATGCGTAGAGATCGGGAAGAACATCGGTGGCGAAAGCGCTCTACTGGACGGCAACTGACACTCAGGGACGAAAGCTAGGGGAGCGAATGGG
+3  GACGGAGGATGCAAGTGTTATCCGGAATCACTGGGCGTAAAGCGTCTGTAGGTGGTCAAATAAGTCAACTGTTAAATCTTGAGGCTCAACCTCAAAATCGCAGTCGAAACTATTAGACTAGAGTATAGTAGGGGTAAAGGGAATTTCCAGTGGAGCGGTGAAATGCGTAGAGATTGGAAGGAACACCGATGGCGAAGGCACTTTACTGGGCTATTACTAACACTCAGAGACGAAAGCTAGGGTAGCAAATGGG
+4  TACGGAGGGTGCAAGCGTTATCCGGAATCACTGGGTTTAAAGGGTGCGTAGGCGGCATTATAAGTCAGAGGTGAAAGCCCGTCGCTTAACGATGGAATTGCCTTTGATACTGTAGTGCTTGAATCAAGTTGAGGCTGGCGGAATGTGGCATGTAGCGGTGAAATGCATAGATATGCCATAGAACACCAATTGCGAAGGCAGCTGGCTGGGCTTGAATTGACGCTGAGGCACGAAAGCGTGGGGAGCGAACAGG
+5 TACGGGAAGGGCAAGCGTTATCCGACATGATTGGGCGTAAAGAGTCCGTAGATTGTAAAGTAAGTTCTTTGTTAAATTTTAAGACTCAATCTTAATTCAGCAATTAATACTACTTTACTTTGAGTTTAATACAGAAAAGTAGAATTTTATACGATAAAGGTGAAATTTGTAGATATATAAAGGAATGCCAATAGCGAAGGCAACTTTTTGGTATAAACTGACGTTGAGGGACGAAAGCTTGGGTAGCAAACGGG
+6  TACAGAGGGTGCAAGCGTTAATCGGAATGACTGGGCGTAAAGCGTGCGTAGGCGGTTGCCTAAGTCGGATGTGAAAGCCCCGTGCTTAACATGGGAACTGCATTCGATACTGGGTGACTAGAGTACAGCAGAGGATAGTGGAATTCCACGTGTAGCGGTGAAATGCGTAGATATGTGGAGGAACATCGGTGGCGAAGGCGACTGTCTGGGCTGATACTGACGCTGAGGTACGAAAGCGTGGGGAGCAAACAGG
+  abundance forward reverse nmatch nmismatch nindel prefer accept
+1      3705       1       1    187         0      0      1   TRUE
+2      3057       2       2    187         0      0      1   TRUE
+3      2027       3       3    187         0      0      1   TRUE
+4      1651       4       4    187         0      0      1   TRUE
+5      1278       5       5    186         0      0      2   TRUE
+6      1102       7       6    187         0      0      2   TRUE
+
+
+> summary((mergers[[1]]))
+   sequence           abundance          forward          reverse           nmatch        nmismatch
+ Length:1603        Min.   :   2.00   Min.   :   1.0   Min.   :   1.0   Min.   :168.0   Min.   :0  
+ Class :character   1st Qu.:   9.00   1st Qu.: 395.5   1st Qu.: 400.5   1st Qu.:187.0   1st Qu.:0  
+ Mode  :character   Median :  19.00   Median : 820.0   Median : 824.0   Median :187.0   Median :0  
+                    Mean   :  51.54   Mean   : 840.0   Mean   : 842.4   Mean   :186.9   Mean   :0  
+                    3rd Qu.:  42.50   3rd Qu.:1270.5   3rd Qu.:1267.5   3rd Qu.:187.0   3rd Qu.:0  
+                    Max.   :3705.00   Max.   :1823.0   Max.   :1822.0   Max.   :218.0   Max.   :0  
+     nindel      prefer       accept       
+ Min.   :0   Min.   :1.000   Mode:logical  
+ 1st Qu.:0   1st Qu.:1.000   TRUE:1603     
+ Median :0   Median :1.000                 
+ Mean   :0   Mean   :1.327                 
+ 3rd Qu.:0   3rd Qu.:2.000                 
+ Max.   :0   Max.   :2.000      
+ 
+ saved mergers as one full file and also as chunks (in case too large to work with downstream!)
+
+
+sequence tab results:
+seqtab <- makeSequenceTable(mergers)
+> dim(seqtab)
+[1]   132 32974
+> saveRDS(seqtab, file="seqtab_ch4_16S.rds")
+> write.csv(seqtab, file="seqtab_ch4_16S.csv")
+> table(nchar(getSequences(seqtab)))
+
+  221   222   224   226   229   231   232   233   235   236   237   238   239   240   241   242   244   245 
+    2     5     4     1     8     8     4     1     2     2     3     1     2     8     1     2     4     3 
+  246   247   248   249   250   251   252   253   254   255   256   257   258   259   260   261   262   263 
+    4    14     3    19    23    58   790 27802  3424   378   176    39    16    21     6     3     2     7 
+  264   265   266   267   268   270   271   272   273   275   276   278   280   282   285   287   289   293 
+    5     1     1     1     1     1     3     9     1     2     3     1     2     3     2     1     3     1 
+  294   307   309   344   347   349   351   360   364   365   367   369   371   376   379   390   392   393 
+    1     1     1     1     2     2     1     3     2     3     1     1     3     1     1     2     1     1 
+  394   397   398   400   404   405   409   410   411   412   413   414   418   419   421   422 
+    2     2     1     2     3     1     2     7     6     1     1     5     5    16     2     3 
+> plot(table(nchar(getSequences(seqtab))))
+majority fall around ~250
+
+
+Removing chimeras! ~ this takes 1.5 hours
+seqtab.nochim <- removeBimeraDenovo(seqtab2, method="consensus", multithread=TRUE, verbose=TRUE)
+
+Identified 1173 bimeras out of 32794 input sequences.
+> dim(seqtab.nochim) 
+[1]   132 31621
+> saveRDS(seqtab.nochim, file="seqtab.nochim_ch4_16S.rds")
+> write.csv(seqtab.nochim, file="seqtab.nochim_ch4_16S.csv")
+> 
+> sum(seqtab.nochim)/sum(seqtab2)
+[1] 0.9852178
+
+
+Track Sequence Reads 
+A final check of progressive, this will look at the number of reads that made it through each step in the pipeline. Sanity check! 
+
+~need to save the out file first 
+```{r}
+saveRDS(out, file = "out.rds")
+```
+head(track)
+                input filtered denoised merged tabled nonchim
+Mat_10P_TCATTC 107619    91783    87827  82612  82556   82168
+Mat_11P_TCATTC 103746    89191    86427  81684  81680   81531
+Mat_12P_TCATTC 103514    88873    85589  80572  79913   78889
+Mat_13P_TCATTC  77284    66084    62720  57437  57407   57078
+Mat_14P_TCATTC 123187   106700   102268  95094  94947   94326
+Mat_15P_TCATTC 132700   114627   110512 104758 104476  104247
+
+ tail(track)
+           input filtered denoised merged tabled nonchim
+MM_TEMP_H4 89087    65073    60607  55111  55083   54957
+MM_TEMP_H5 86312    62875    58709  54592  54578   54344
+MM_TEMP_H6 91556    66342    63554  58645  58631   58140
+MM_TEMP_H7 90742    66489    61001  54276  54276   53136
+MM_TEMP_H8 58641    42126    38568  34451  34451   34289
+MM_TEMP_H9 99970    73295    70193  66101  66082   65672
+
+saved as: CH4_16S_readstats.csv
+
+Assign taxa steps:
+both silva_nr99_v138.1_train_set.fa AND silva_species_assignment_v138.1.fa were uploaded into the working directory 
+
+this ran for ~10+ hours, then i gave up, logged out of r session and then opened a new r session and suddenly, taxa was loaded! 
+
+taxa <- assignTaxonomy(seqtab.nochim, "silva_nr99_v138.1_train_set.fa", multithread = TRUE) 
+~this will take a WHILE~ started at 9:40PM - 
+
+saveRDS(taxa, file="CH4_16S_taxa.rds") 
+
+dim(taxa)
+[1] 31621     6
+
+Let's see if we can hand off to phyloseq on local! 
+
+Installing packages
+```{r}
+BiocManager::install("phyloseq")
+install.packages("Rmisc")
+```
+```{r}
+library('phyloseq')
+library('ggplot2')
+library(cowplot)
+library(ShortRead)
+library('Rmisc')
+```
+
+lots of NA in genus, so not going to bother with species 
+```{r}
+taxa <- readRDS("CH4_16S_taxa.rds")
+seqtab.nochim<- readRDS("seqtab.nochim_ch4_16S.rds")
+```
+
+```{r}
+taxa_df <- as.data.frame(taxa)
+
+colnames(taxa_df)
+```
+
+
+```{r}
+sum(is.na(taxa_df$Genus))
+sum(is.na(taxa_df$Family))
+```
+
+
+
+Add in Metadata
+```{r}
+samples.out <- rownames(seqtab.nochim)
+head(samples.out)
+length(samples.out)
+```
+Investigating the data further
+```{r}
+View(taxa)
+View(seqtab.nochim)
+```
+
+Leftover F's in the names of seqtab.nochim even though they have already been merged, taking out any leftover Fs or Rs from the names !
+also need to take out the _.filt.fastq.gz ~ it is important to row names match in the seqtab.nochim and metadata dataframes! 
+```{r}
+rownames(seqtab.nochim) <- gsub("F|R", "", rownames(seqtab.nochim))
+rownames(seqtab.nochim) <- gsub("_filt.fastq.gz", "", rownames(seqtab.nochim))
+
+View(seqtab.nochim)
+```
+
+```{r}
+data.frame(Row = 1:nrow(seqtab.nochim), Sample = rownames(seqtab.nochim))
+```
+
+now, must add in metadata!
+
+```{r}
+samdf<-read.csv("Metadata_CH4.csv")
+head(samdf)
+rownames(samdf) <- samdf$Sample
+```
+```{r}
+samdf <- samdf[, -c(6:8)]
+```
+
+This is combining seqtab.nochim with taxa.plus and samdf
+- ensure row names match!
+-REMAKE metadata in the order of the rows!*******very important!!!
+
+Handover to phyloseq!
+
+```{r}
+ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(samdf), 
+               tax_table(taxa)) 
+ps
+```
+phyloseq-class experiment-level object
+otu_table()   OTU Table:         [ 31621 taxa and 132 samples ]
+sample_data() Sample Data:       [ 132 samples by 5 sample variables ]
+tax_table()   Taxonomy Table:    [ 31621 taxa by 6 taxonomic ranks ]
+
+noice noice 
+
+
+TAX.GLOM function is aggregating similar ASV into taxonomic ranks (phylum, class, order, family, genus). Since I am interested in comparing microbiomes between treatments then I change my x to "Treatment." from my metadata. 
+
+Multiple reads can match an ASV - this is how you get abundance data. (ASV is the specific taxa being identified). This step takes a few minutes to run
+
+Memory limite reached for family, so doing genus just to check, will actually make plots at the family level !
+```{r}
+ps_glom <- tax_glom(ps, "Genus")
+```
+
+```{r}
+plot_bar(ps_glom, x="Experiment", fill="Genus")+
+  theme(legend.position="none")
+```
+Making the ASV names shorter
+```{r}
+ids <- paste0("sq", seq(1, length(colnames(seqtab.nochim))))
+```
+
+Saving phyloseq object to wd in case r crashes 
+```{r}
+saveRDS(ps, file = "ps.rds")
+```
+
+
+20. Removing Contaminants. 
+
+
+A) First Renaming Stuff:
+This assigns the values in 'ids' to be the column names of the 'seqtab.nochim' table. Creating taxa2 by combining taxa.plus with its row names. Now assigning values in ids to be the names of the taxa2 table. 
+
+Essentially, this is renaming stuff.
+
+seqtab.nochim ~ has the sequences (shortened to ids) as the columns, the samples as the rows, and the abundance is what is displayed
+
+```{r}
+colnames(seqtab.nochim)<-ids
+taxa2 <- cbind(taxa, rownames(taxa)) #retaining raw sequence info before renaming
+rownames(taxa2)<-ids
+```
+
+```{r}
+saveRDS(seqtab.nochim, file = "seqtab.nochim.updated.ids.rds")
+```
+
+```{r}
+saveRDS(taxa2, file = "taxa2.rds")
+```
+
+updated phyloseq! 
+
+This code constructs a phyloseq object named ps by combining the ASV table "seqtab.nochim", sample metadata "samdf", and NEW taxonomy table "taxa2" 
+```{r}
+ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(samdf), 
+               tax_table(taxa2))
+ps
+```
+phyloseq-class experiment-level object
+otu_table()   OTU Table:         [ 31621 taxa and 132 samples ]
+sample_data() Sample Data:       [ 132 samples by 5 sample variables ]
+tax_table()   Taxonomy Table:    [ 31621 taxa by 7 taxonomic ranks ]
+
+Saving phyloseq object to wd in case r crashes 
+```{r}
+saveRDS(ps, file = "ps.rds")
+```
+
+B) Now, removing mitochondria, chloroplasts & non-bacteria taxa.
+
+First, identifying contaminants ~
+```{r}
+ps.mito <- subset_taxa(ps, (Family=="Mitochondria"))
+ps.mito
+```
+ 822 mito identified - must be removed 
+ 
+```{r}
+ps.chlor <- subset_taxa(ps, (Order=="Chloroplast"))
+ps.chlor
+```
+247 chloro identified - must be removed 
+ 
+```{r}
+ps.notbact <- subset_taxa(ps, (Kingdom!="Bacteria") | is.na(Kingdom))
+ps.notbact
+```
+2692 notbacteria sequences present - these will ALSO need to be removed
+
+```{r}
+ps.nomito <- subset_taxa(ps, (Family!="Mitochondria") | is.na(Family))
+ps.nomito
+```
+This is data with mitochondria removed (total ps sequences - ps.mito sequences)
+= 31621(total taxa) - 822 mitochondria = 30,799
+
+```{r}
+ps.nochlor <- subset_taxa(ps.nomito, (Order!="Chloroplast") | is.na(Order))
+ps.nochlor
+```
+30,799 - 247 = 30,552
+
+```{r}
+ps.clean <- subset_taxa(ps.nochlor, (Kingdom=="Bacteria"))
+ps.clean
+```
+30,552 - 2692 = 27,860 
+
+clean ps! need to save 
+```{r}
+saveRDS(ps.clean, file = "ch4_psclean.rds")
+```
+
+C) Just for funsies - This is how much archaea was identified 
+```{r}
+ps.arch <- subset_taxa(ps.nomito, (Kingdom=="Archaea"))
+ps.arch 
+```
+2692 not bacteria ~ 2,683 of this was archae! 
+
+D) Removing negative controls from samples!
+
+Installing decontam package: 
+```{r}
+BiocManager::install("decontam") #might already be installed
+```
+
+```{r}
+library(decontam)
+```
+
+This code first converts sample data (ps.clean) to dataframe. 
+Then it calculates the library size (total number of reads) for each sample in ps.clean and adds a new column 'library size' into the dataframe 'df'
+Then df is ordered in ascending order by library size
+The df$index creates a new column 'index' that contains sequential numbers from 1 to the number of rows in the dataframe (x axis in plot)
+
+ggplot: creates a scatterplot. Index is the x axis, library size is the y axis, and colors are the points by the treatment variable (this is because this is the variable we are comparing microbiome data to each other)
+
+
+```{r}
+df <- as.data.frame(sample_data(ps.clean)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(ps.clean)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=Experiment)) + 
+  geom_point()
+```
+Green is the neg controls, good, they are lowest library size. Looking for trends in # reads compared to experiment ~ temp experiment had the lowest reads, then field and summer experiments were higher (and very similar) 
+
+```{r}
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=Week)) + 
+  geom_point()
+```
+no correlations really?
+
+Contaminant Table:
+-The first line creates a new column 'is.neg' in the object of 'ps.clean'.checks to make sure the 'Sample' column in the metadata is equal to '16S' - this is the negative control 
+
+-The next line uses "isContaminant" function to identify potential contaminants in ps.clean - puts .5 as a threshold (if a feature has a 50% or more probability of being a contaminant, it is removed)
+
+-The last line creates a table of the contaminant column in the new contamdf.prev dataframe. This takes a minute to run. 
+```{r}
+sample_data(ps.clean)$is.neg <- sample_data(ps.clean)$Experiment == "Neg"
+contamdf.prev <- isContaminant(ps.clean, neg="is.neg",threshold=0.5)
+table(contamdf.prev$contaminant)
+```
+
+This means out of my 27,832 OTUS/ASVs, 28 were identified as contaminants. The identification of contaminants is throughout all samples (using the negative control to help identify likely contaminants)
+
+
+The first line applies a transformation to the sample counts in the ps.clean (either presence or absent)
+- The next line is identifying the neg controls in the ps.pa object 
+- The final line is identifying the samples that are not negative controls 
+Summary: transforming to presence/absence data and subsetting samples that are neg controls vs all other samples (only neg control samples are Experiment== Neg)
+```{r}
+ps.pa <- transform_sample_counts(ps.clean, function(abund) 1*(abund>0))
+ps.pa.neg <- prune_samples(sample_data(ps.pa)$Experiment == "Neg", ps.pa) 
+ps.pa.pos <- prune_samples(sample_data(ps.pa)$Experiment != "Neg", ps.pa)
+```
+
+Make data.frame of prevalence in positive and negative samples
+```{r}
+df.pa <- data.frame(pa.pos=taxa_sums(ps.pa.pos), pa.neg=taxa_sums(ps.pa.neg),
+                    contaminant=contamdf.prev$contaminant)
+ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() +
+  xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)")
+```
+
+This is visualizing the contaminants within all the samples. (contaminants identified using negative control). Contaminants are blue. ~ should be only 28 dots 
+
+
+This is removing contaminant taxa (identified above) from all your samples (from the phyloseq object)
+```{r}
+ps.clean1 <- prune_taxa(!contamdf.prev$contaminant,ps.clean)
+```
+ps.clean1 has contaminants removed ~ but still the negative controls in there 
+
+Now, you are removing your negative controls as well - because we do not need these anymore
+```{r}
+ps.cleaner <- subset_samples(ps.clean1,(Experiment!="Neg"))
+ps.cleaner
+```
+phyloseq-class experiment-level object
+otu_table()   OTU Table:         [ 27832 taxa and 129 samples ]
+sample_data() Sample Data:       [ 129 samples by 6 sample variables ]
+tax_table()   Taxonomy Table:    [ 27832 taxa by 7 taxonomic ranks ]
+
+*Check: SINCE 3 neg controls, should have 3 less # of samples (so 132 - 3 = 129 samples)
+27,832 "non-contaminated" taxa and 129 samples 
+
+Saving files: *PS.CLEANER IS MOST IMPORTANT AT THIS POINT. This should have clean data (neg controls and contaminant sequences from neg controls removed in all samples)
+```{r}
+saveRDS(ps.cleaner, file ="CH4_ps.cleaner.RDS") #IMPORTANT ONE USED FOR STATS
+```
+
+This is turning the cleaned asv data (ps.cleaner) along with the metadata into an otu table, and then a dataframe. This is to help with future r manipulations and steps.
+```{r}
+seqtab.cleaner <- data.frame(ps.cleaner@otu_table)
+samdf.cleaner <- data.frame(ps.cleaner@sam_data)
+write.csv(samdf.cleaner)
+```
+
+saving to my working directory 
+```{r}
+write.csv(samdf.cleaner, "samdf.cleaner.csv", row.names = FALSE)
+```
+ 
+Not rarefying, so preprocessing is complete! :)
+
+*added species on tower ~ only found 241 species, so continued with taxa dataset (not taxa plus) for anayses 
+
+~
+reporting how many reads were kept
+```{r}
+library(phyloseq)
+ps.cleaner <- readRDS("CH4_ps.cleaner.RDS")
+ps.cleaner
+reads.df <- as.data.frame(sample_data(ps.cleaner))
+reads.df$FinalReads <- sample_sums(ps.cleaner)
+range(reads.df$FinalReads)
+mean(reads.df$FinalReads)
+sd(reads.df$FinalReads)
+```
+samples have 28,878 - 150,166 reads 
+```{r}
+#how many reads were kept? 
+  track <- read.csv("CH4_16S_readstats.csv", row.names = 1)
+head(rownames(track))
+```
+
+~fixing name mismatch
+```{r}
+head(rownames(reads.df))
+rownames(reads.df) <- sub("_$", "", rownames(reads.df))
+head(rownames(reads.df))
+```
+```{r}
+reads.df$InputReads <- track[rownames(reads.df), "input"]
+sum(is.na(reads.df$InputReads))
+```
+```{r}
+rownames(reads.df)[is.na(reads.df$InputReads)]
+```
+```{r}
+rownames(track) <- gsub("F|R", "", rownames(track))
+sum(duplicated(rownames(track)))
+```
+```{r}
+reads.df$InputReads <- track[rownames(reads.df), "input"]
+sum(is.na(reads.df$InputReads))
+```
+
+~looking at number of reads kept!
+```{r}
+reads.df$PctKept <- reads.df$FinalReads / reads.df$InputReads * 100
+range(reads.df$PctKept)
+mean(reads.df$PctKept)
+sd(reads.df$PctKept)
+```
+
+
+
+
