@@ -1,0 +1,1531 @@
+---
+title: "Dist.Sum.Git2"
+output: html_document
+date: "2026-11-11"
+---
+
+
+
+libs:
+libraries:
+```{r}
+library(ggnewscale)
+library(ggplot2)
+library(cowplot)
+library(phyloseq)
+library(car)
+library(ggpubr)
+library(vegan) #vegan 2.6-4
+library(dada2)
+library(RColorBrewer)
+library(dplyr)
+library(tidyverse)
+library(stringr)
+library(dplyr)
+library(stats)
+library(ggplot2)
+library(ggpubr)
+library(vegan)
+library(cowplot)
+library(tidyverse)
+library(phyloseq)
+library(microbiome)
+library("funfuns")
+library(pairwiseAdonis)
+library(viridis)
+library("microViz")
+library(ape)
+```
+
+
+
+setting up 
+```{r}
+# ---- libraries (once) ----
+library(tidyverse)      # dplyr, ggplot2, stringr, tidyr
+library(phyloseq); library(vegan); library(microbiome); library(microViz)
+library(car); library(ggpubr); library(cowplot); library(viridis); library(ape)
+library(pairwiseAdonis); library(ANCOMBC)
+set.seed(123)
+
+# ---- read + subset to Summer ----
+ps.cleaner <- readRDS("CH4_ps.cleaner.RDS")
+ps.cleaner.filtered <- prune_taxa(taxa_sums(ps.cleaner) > 0, ps.cleaner)
+
+dist.sum.git.ps <- subset_samples(ps.cleaner.filtered, Experiment == "Summer")
+dist.sum.git.ps <- prune_taxa(taxa_sums(dist.sum.git.ps) > 0, dist.sum.git.ps)
+
+# ---- clean once, at the all-weeks level ----
+tt <- tax_table(dist.sum.git.ps); colnames(tt)[7] <- "Sequence"
+tax_table(dist.sum.git.ps) <- tt
+
+sd <- data.frame(sample_data(dist.sum.git.ps))
+sd$is.neg <- NULL
+sd$Temperature <- factor(sd$Temperature, levels = c(22, 26))
+sd$Treatment   <- factor(sd$Treatment,
+                         levels = c("ND","Few Small","Many Small","Few Large","HD"))
+stopifnot(!anyNA(sd$Temperature), !anyNA(sd$Treatment))   # stops if any label was lost
+sample_data(dist.sum.git.ps) <- sample_data(sd)
+
+# ---- Week 5 objects ----
+dist.sum.git.wk5.ps <- subset_samples(dist.sum.git.ps, Week == 5)
+dist.sum.git.wk5.ps <- prune_taxa(taxa_sums(dist.sum.git.wk5.ps) > 0, dist.sum.git.wk5.ps)
+
+dist.sum.git.wk5.noHD.ps <- subset_samples(dist.sum.git.wk5.ps, Treatment != "HD")
+dist.sum.git.wk5.noHD.ps <- prune_taxa(taxa_sums(dist.sum.git.wk5.noHD.ps) > 0,
+                                       dist.sum.git.wk5.noHD.ps)
+sample_data(dist.sum.git.wk5.noHD.ps) <-
+  sample_data(droplevels(data.frame(sample_data(dist.sum.git.wk5.noHD.ps))))
+
+# ---- verify (should match what you saw before) ----
+stopifnot(nsamples(dist.sum.git.wk5.ps) == 27, ntaxa(dist.sum.git.wk5.ps) == 13467,
+          nsamples(dist.sum.git.wk5.noHD.ps) == 24)
+rank_names(dist.sum.git.wk5.ps)    # 7th = "Sequence"
+table(sample_data(dist.sum.git.wk5.noHD.ps)$Temperature,
+      sample_data(dist.sum.git.wk5.noHD.ps)$Treatment)   # 3 per cell
+```
+```{r}
+# ---- Before filtering ----
+ntaxa(ps.cleaner)
+nsamples(ps.cleaner)
+
+# ---- After filtering ----
+ntaxa(ps.cleaner.filtered)
+nsamples(ps.cleaner.filtered)
+```
+[1] 27832
+[1] 129
+[1] 27802
+[1] 129
+
+
+```{r}
+ps  <- dist.sum.git.wk5.ps
+otu <- as(otu_table(ps), "matrix")                      # samples x ASVs
+seqs <- as.character(tax_table(ps)[, "Sequence"])
+
+## 1. IDs and sequences are consistent
+anyDuplicated(taxa_names(ps))                           # 0
+anyDuplicated(seqs)                                     # 0
+all(grepl("^[ACGT]+$", seqs))                           # TRUE (no N or odd characters)
+table(nchar(seqs))                                      # most should be ~252-254 bp
+sum(otu[, nchar(seqs) < 250 | nchar(seqs) > 256]) / sum(otu) * 100   # % of reads in off-length ASVs
+
+## 2. Sparsity and prevalence (this informs the prevalence filter)
+mean(otu == 0) * 100                                    # % of zero cells
+prev  <- colSums(otu > 0)
+reads <- colSums(otu)
+data.frame(
+  prevalence = c("1 sample", "2 samples", "3-5 samples", "6+ samples"),
+  n_ASVs     = c(sum(prev == 1), sum(prev == 2), sum(prev %in% 3:5), sum(prev >= 6)),
+  pct_reads  = c(sum(reads[prev == 1]), sum(reads[prev == 2]),
+                 sum(reads[prev %in% 3:5]), sum(reads[prev >= 6])) / sum(reads) * 100
+)
+
+## 3. Dominant ASVs
+top <- sort(reads, decreasing = TRUE)[1:10]
+data.frame(ASV = names(top), pct_reads = round(top / sum(reads) * 100, 2),
+           as.data.frame(as(tax_table(ps)[names(top), c("Phylum","Class","Genus")], "matrix")))
+
+## 4. Richness vs. depth (relevant to the rarefaction decision)
+cor(rowSums(otu > 0), rowSums(otu), method = "spearman")
+
+## 5. Read-weighted taxonomy assignment (the check from before)
+tt <- as.data.frame(tax_table(ps))
+sapply(c("Phylum","Class","Order","Family","Genus"),
+       function(r) sum(reads[!is.na(tt[[r]])]) / sum(reads) * 100)
+
+## 6. Do the saved pipeline files match the phyloseq object?
+seqtab.orig <- readRDS("seqtab.nochim_ch4_16S.rds")
+rownames(seqtab.orig) <- gsub("F|R", "", rownames(seqtab.orig))        # same cleanup you used
+rownames(seqtab.orig) <- gsub("_filt.fastq.gz", "", rownames(seqtab.orig))
+common_s <- intersect(rownames(otu), rownames(seqtab.orig))
+length(common_s)                                        # 27
+all(seqs %in% colnames(seqtab.orig))                    # TRUE
+m <- otu; colnames(m) <- seqs
+all(m[common_s, seqs] == seqtab.orig[common_s, seqs])   # TRUE: counts unchanged
+anyDuplicated(sample_names(ps.cleaner))                 # 0 across all 3 experiments
+
+#looking at taxonomic resolution
+reads <- taxa_sums(ps)
+sapply(c("Phylum","Class","Order","Family","Genus"), function(r) {
+  x  <- tt[[r]]
+  ok <- !is.na(x) & !grepl("uncultured|unclassified|Incertae|metagenome", x, ignore.case = TRUE)
+  sum(reads[ok]) / sum(reads) * 100
+})
+```
+[1] 0 ~ every asv has a unique name
+[1] 0 ~ no duplicat sequences
+[1] TRUE ~ no ambiguous bases
+
+  247   250   251   252   253   254   255   256   257   259   261 
+    1     1     5   178 12680   552    40     5     1     3     1 
+    
+    length of asvs is around 250 ~ V4 amplicon length looks good 
+[1] 0.003805103 ~ six odd length asvs (no length filter needed)
+[1] 82.48201 ~ percent of zeros ~ typical for 16s data ~ for clr data this needs to be handles
+[1] 0.6691087 ~ deeper samples have more reads 
+
+  Phylum    Class    Order   Family    Genus 
+99.04521 97.26646 90.02535 80.08718 47.53453 
+% reads assigned at each taxonomic ranking 
+
+[1] 27 ~ all samples for week 5 present
+[1] TRUE
+[1] TRUE
+[1] 0
+
+prevalence tables 
+found in            ASVs            % of reads
+
+1 sample          	5546	          2.811899		
+2 samples	          1980	          2.552506		
+3-5 samples       	2543        	7.386925		
+6+ samples        	3398	        87.248670	
+
+Most ASVs are rare.
+- 56% appear in only 1 or 2 samples, but together they carry just 5.4% of reads.
+- Filter?: requiring presence in at least 3 samples (matching your replicate number) drops 7,526 ASVs but only 5.4% of reads. 
+- That is a good trade for beta diversity (CLR/Aitchison) and ANCOM-BC2.
+- note: Don’t apply this filter before alpha diversity, since rare ASVs contribute to richness.
+
+  Phylum    Class    Order   Family    Genus 
+99.04521 97.26646 88.53336 79.99065 47.53453 
+
+at each taxonomic rank, the percentage is the share of all sequencing reads that belong to ASVs with a taxonomic label at that rank (e.g., 99.0% of reads were classified to phylum and 80.0% to family).
+
+phylum and class are great 
+order and family are okay...
+```{r}
+ps  <- dist.sum.git.wk5.ps
+tt  <- as.data.frame(tax_table(ps))
+otu <- as(otu_table(ps), "matrix")      # samples x ASVs
+
+data.frame(
+  Metric = c("Samples", "ASVs", "Total reads",
+             "Phyla", "Classes", "Orders", "Families", "Genera"),
+  Value  = c(nsamples(ps), ntaxa(ps), sum(sample_sums(ps)),
+             n_distinct(tt$Phylum, na.rm = TRUE), n_distinct(tt$Class,  na.rm = TRUE),
+             n_distinct(tt$Order,  na.rm = TRUE), n_distinct(tt$Family, na.rm = TRUE),
+             n_distinct(tt$Genus,  na.rm = TRUE))
+)
+
+summary(sample_sums(ps))       # reads per sample
+summary(taxa_sums(ps))         # reads per ASV
+summary(rowSums(otu > 0))      # ASVs detected per sample (observed richness)
+```
+Metric
+
+Samples	27			
+ASVs	13467			
+Total reads	2785733			
+Phyla	57			
+Classes	113			
+Orders	261			
+Families	321			
+Genera	542
+
+
+Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+  38255   87182  104133  103175  125606  150166 
+   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+    2.0     9.0    26.0   206.9   111.0 44192.0 
+   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+   1475    2108    2453    2359    2638    3159 
+
+phyloseq object for this experiment - dist.sum.git.wek5.ps
+```{r}
+nsamples(dist.sum.git.wk5.ps) # sample count
+ntaxa(dist.sum.git.wk5.ps) #asv count
+sum(taxa_sums(dist.sum.git.wk5.ps) == 0) #should print 0
+sum(sample_sums(dist.sum.git.wk5.ps))     # total reads across all samples
+range(sample_sums(dist.sum.git.wk5.ps))   # min and max reads per sample
+```
+
+~
+BARPLOT
+~
+
+```{r}
+make_tax_plot_wk5 <- function(ps, tax_rank, rare_cutoff = 1) {
+  # 1. Subset Week 5 samples
+  ps_wk5 <- subset_samples(ps, Week == 5)
+  ps_wk5 <- prune_taxa(taxa_sums(ps_wk5) > 0, ps_wk5)
+  # 2. Aggregate ASVs at selected taxonomic level
+  ps_tax <- tax_glom(ps_wk5, taxrank = tax_rank, NArm = FALSE)
+  # 3. Relative abundance within each sample
+  ps_rel <- transform_sample_counts(ps_tax, function(x) x / sum(x))
+  # 4. Convert to dataframe
+  summer_df <- psmelt(ps_rel)
+  summer_df$Taxon <- as.character(summer_df[[tax_rank]])
+  #max group mean
+    taxon_overall <- summer_df %>%
+    group_by(Sample, Temperature, Treatment, Taxon) %>%
+    summarise(Ab = sum(Abundance), .groups = "drop") %>%
+    group_by(Temperature, Treatment, Taxon) %>%
+    summarise(Group_Mean = mean(Ab) * 100, .groups = "drop") %>%
+    group_by(Taxon) %>%
+    summarise(Mean_Percentage = max(Group_Mean), .groups = "drop")
+  
+  # 6. Group unassigned and rare taxa
+  summer_df <- summer_df %>%
+    left_join(taxon_overall, by = "Taxon") %>%
+    mutate(
+      Taxon_grouped = case_when(
+        is.na(Taxon) | trimws(Taxon) == "" |
+          tolower(trimws(Taxon)) %in% c("na", "unclassified", "unknown") ~
+          paste("Unassigned at", tax_rank, "level"),
+        Mean_Percentage < rare_cutoff ~ "Rare taxa",
+        TRUE ~ Taxon
+      )
+    )
+  # 7. Combine taxa within each sample
+  summer_sample_df <- summer_df %>%
+    group_by(Sample, Temperature, Treatment, Taxon_grouped) %>%
+    summarise(Relative_Abundance = sum(Abundance), .groups = "drop")
+  # 8. Average across biological replicates
+  summer_summary <- summer_sample_df %>%
+    group_by(Temperature, Treatment, Taxon_grouped) %>%
+    summarise(Mean_Relative_Abundance = mean(Relative_Abundance), .groups = "drop") %>%
+    mutate(
+      Temperature = factor(Temperature, levels = c("22", "26")),
+      Treatment = factor(Treatment,
+                         levels = c("ND", "Few Small", "Many Small", "Few Large", "HD")),
+      Mean_Percentage = Mean_Relative_Abundance * 100
+    )
+  # 9. Set up colors
+  taxon_levels <- unique(as.character(summer_summary$Taxon_grouped))
+  distinct_palette <- c(
+    "#1f78b4", "#FF69B4", "#33a02c", "#ff7f00", "#984ea3", "#e41a1c",
+    "#4ea3d9", "#b07cc6", "#66c2a5", "#a65628", "#f781bf", "#238b45",
+    "#6a3d9a", "#e6ab02", "#00a6d6", "#d95f02", "#8c6bb1", "#41ae76",
+    "#fb6a4a", "#377eb8", "#cab2d6", "#b15928", "#74c476", "#e7298a",
+    "#ffd92f", "#006d2c", "#a6cee3", "#d4b9da", "#ff9933", "#7b3294"
+  )
+  special_colors <- c("Rare taxa" = "grey70")
+  special_colors[paste("Unassigned at", tax_rank, "level")] <- "darkblue"
+
+  regular_taxa <- setdiff(taxon_levels, names(special_colors))
+
+  # FIXED: warn if colors will repeat
+  if (length(regular_taxa) > length(distinct_palette)) {
+    message(length(regular_taxa), " taxa but only ", length(distinct_palette),
+            " colors: colors will repeat. Consider rare_cutoff > 0.")
+  }
+  regular_colors <- setNames(
+    rep(distinct_palette, length.out = length(regular_taxa)),
+    regular_taxa
+  )
+  taxon_colors <- c(regular_colors, special_colors)
+  # 10. Create bar plot
+  summer_plot <- ggplot(
+    summer_summary,
+    aes(x = Temperature, y = Mean_Percentage, fill = Taxon_grouped)
+  ) +
+    geom_col(color = "white", linewidth = 0.15) +
+    facet_wrap(~ Treatment, nrow = 1) +
+    scale_fill_manual(values = taxon_colors, breaks = taxon_levels, drop = FALSE) +
+    # FIXED: scale_y has no limits; coord_cartesian sets the range safely
+    scale_y_continuous(breaks = seq(0, 100, 20)) +
+    coord_cartesian(ylim = c(0, 100), expand = FALSE) +
+    labs(
+      x = "Temperature (°C)",
+      y = "Mean Relative Abundance (%)",
+      fill = tax_rank,
+      title = paste("Week 5 Summer Microbial Community:", tax_rank)
+    ) +
+    theme_bw() +
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.key.height = grid::unit(0.4, "cm"),
+      strip.text = element_text(face = "bold"),
+      axis.text = element_text(color = "black"),
+      plot.title = element_text(face = "bold", hjust = 0.5)
+    )
+  list(
+    aggregated = ps_tax,
+    dataframe = summer_df,
+    sample_summary = summer_sample_df,
+    summary = summer_summary,
+    colors = taxon_colors,
+    plot = summer_plot
+  )
+}
+```
+
+
+```{r}
+phylum.rare <- make_tax_plot_wk5(dist.sum.git.ps, "Phylum", rare_cutoff = 1)
+phylum.all  <- make_tax_plot_wk5(dist.sum.git.ps, "Phylum", rare_cutoff = 0)
+class.rare  <- make_tax_plot_wk5(dist.sum.git.ps, "Class",  rare_cutoff = 1)
+class.all   <- make_tax_plot_wk5(dist.sum.git.ps, "Class",  rare_cutoff = 0)
+
+phylum.rare$plot; phylum.all$plot; class.rare$plot; class.all$plot
+
+# CHECK: every cell should total 100
+lapply(list(phylum.rare = phylum.rare, phylum.all = phylum.all,
+            class.rare = class.rare, class.all = class.all), function(x)
+  x$summary %>% group_by(Temperature, Treatment) %>%
+    summarise(total = sum(Mean_Percentage), .groups = "drop") %>%
+    pull(total) %>% range())
+
+# Mean relative abundance tables (replace all.phylum.wk5 / all.class.wk5)
+phylum.all$sample_summary %>% group_by(Taxon_grouped) %>%
+  summarise(Mean_Relative_Abundance = mean(Relative_Abundance) * 100) %>%
+  arrange(desc(Mean_Relative_Abundance))
+
+class.all$sample_summary %>% group_by(Taxon_grouped) %>%
+  summarise(Mean_Relative_Abundance = mean(Relative_Abundance) * 100) %>%
+  arrange(desc(Mean_Relative_Abundance))
+
+# Save
+#ggsave("Summer_Week5_Top_Phyla1.pdf",   phylum.rare$plot, width = 10, height = 7)
+#ggsave("Summer_Week5_All_Phyla1.pdf",   phylum.all$plot,  width = 16, height = 7)
+#ggsave("Summer_Week5_Top_Classes1.pdf", class.rare$plot,  width = 10, height = 7)
+#ggsave("Summer_Week5_All_Classes1.pdf", class.all$plot,   width = 20, height = 7)
+```
+
+quick look at "by sample" 
+```{r}
+class_sample_plot <- class.rare$sample_summary %>%
+  mutate(
+    Temperature = factor(Temperature, levels = c("22", "26")),
+    Treatment = factor(Treatment,
+                       levels = c("ND", "Few Small", "Many Small", "Few Large", "HD")),
+    Percentage = Relative_Abundance * 100
+  ) %>%
+  ggplot(aes(x = Sample, y = Percentage, fill = Taxon_grouped)) +
+  geom_col(color = "white", linewidth = 0.15) +
+  facet_grid(~ Treatment + Temperature, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = class.rare$colors,
+                    breaks = names(class.rare$colors)) +
+  scale_y_continuous(breaks = seq(0, 100, 20)) +
+  coord_cartesian(ylim = c(0, 100), expand = FALSE) +
+  labs(x = "Sample", y = "Relative Abundance (%)", fill = "Class",
+       title = "Week 5 Summer Microbial Community by Sample: Class") +
+  theme_bw() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.key.height = grid::unit(0.4, "cm"),
+    strip.text = element_text(face = "bold"),
+    axis.text = element_text(color = "black"),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+
+class_sample_plot
+#ggsave("Summer_Week5_Top_Classes_bySample.pdf", class_sample_plot, width = 14, height = 7)
+```
+
+
+
+stacking and matching colors
+```{r}
+library(cowplot)
+
+unassigned <- "Unassigned at Class level"
+
+# taxa in each plot (keeps each plot's own legend order)
+rare.levels <- unique(as.character(class.rare$summary$Taxon_grouped))
+all.levels  <- unique(as.character(class.all$summary$Taxon_grouped))
+
+# common Classes first, so they get unique colors
+common <- setdiff(rare.levels, c("Rare taxa", unassigned))
+others <- setdiff(all.levels, c(common, "Rare taxa", unassigned))
+
+# your 30-color palette, taken from the function's output
+pal <- unique(unname(class.all$colors[!names(class.all$colors) %in% c("Rare taxa", unassigned)]))
+
+shared.colors <- c(
+  setNames(rep(pal, length.out = length(c(common, others))), c(common, others)),
+  "Rare taxa" = "grey70"
+)
+shared.colors[unassigned] <- "darkblue"
+
+class.all.matched <- class.all$plot +
+  scale_fill_manual(values = shared.colors, breaks = all.levels) +
+  guides(fill = guide_legend(ncol = 2)) +          # 1 = one long column, 2–3 = more compact
+  theme(legend.text = element_text(size = 7),
+        legend.key.size = grid::unit(0.3, "cm"))
+class.rare.matched <- class.rare$plot +
+  scale_fill_manual(values = shared.colors, breaks = rare.levels) +
+  theme(legend.text = element_text(size = 7),
+        legend.key.size = grid::unit(0.3, "cm"))
+
+class.stack <- plot_grid(
+  class.rare.matched, class.all.matched,
+  ncol = 1, labels = c("A", "B"), label_size = 14,
+  align = "v", axis = "lr",
+  rel_heights = c(1, 1.6)                          # gives the bottom panel extra height for the taller legend
+)
+class.stack
+
+#ggsave("dist.class_barplots_stacked.pdf", class.stack, width = 14, height = 16)
+#ggsave("dist.class_barplots_stacked.pdf", class.stack, width = 20, height = 10)
+```
+switching order
+```{r}
+class.stack <- plot_grid(
+  class.rare.matched, class.all.matched,
+  ncol = 1, labels = c("A", "B"), label_size = 14,
+  align = "v", axis = "lr"
+)
+class.stack
+
+#ggsave("dist2.class_barplots_stacked.pdf", class.stack, width = 12, height = 19)
+```
+
+
+
+above code interpretation 
+How the plots are built
+- For each sample, read counts at the chosen rank (Phylum or Class) become relative abundance. The denominator is all reads in that sample, including unassigned ones.
+- Taxa are summed within each sample first. This is the step that fixes the bars not reaching 100%.
+- The 3 replicates in each Temperature × Treatment group are then averaged equally, regardless of sequencing depth.
+- HD appears only at 22°C because it has no 26°C samples.
+- What “Rare taxa” means (max group mean version)
+- A taxon goes in the Rare bin if its mean relative abundance is below 1% in every Temperature × Treatment group (rare_cutoff = 1). Put another way, its highest group mean is under 1%.
+- Each group mean is the average of that group’s 3 replicates. HD at 22°C counts as its own group, so there are 9 groups.
+- A taxon that reaches 1% or more in at least one group stays visible, even if it is near zero everywhere else. This keeps treatment-specific taxa in the figure.
+- It is still a group-mean rule, not a per-sample rule. A taxon that is high in a single replicate but averages under 1% in its group is still binned.
+- Every taxon shown separately is at least 1% in at least one bar. The Rare bin can still add up to a noticeable share of some groups, so report that share.
+- “Rare” refers to low-abundance taxa at that rank, not rare ASVs.
+- Unassigned reads form their own category and are not counted as rare.
+- rare_cutoff = 0 bins nothing, which gives your all-taxa plots.
+- Suggested wording for methods
+“Taxa with a mean relative abundance below 1% in every experimental group are shown as ‘Rare taxa’.”
+
+
+~
+Repeated rarefaction = repeated subsampling to a specific sequencing depth that computes a single mean value for each sample.
+Rarefying = a single subsampling to a specific sequencing depth that computes a value for each ASV for each sample.
+~
+
+
+```{r}
+# Number of samples
+nsamples(dist.sum.git.wk5.ps)
+
+# Number of ASVs
+ntaxa(dist.sum.git.wk5.ps)
+
+# Confirm only Week 5 samples remain
+table(sample_data(dist.sum.git.wk5.ps)$Week)
+
+# Check treatment and temperature distribution
+sample_data(dist.sum.git.wk5.ps) %>%
+  data.frame() %>%
+  count(Temperature, Treatment) %>%
+  arrange(Temperature, Treatment)
+
+# Check sequencing depth
+summary(sample_sums(dist.sum.git.wk5.ps))
+```
+[1] 27
+[1] 13467
+
+ 5 
+27 
+   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+  38255   87182  104133  103175  125606  150166 
+  
+without hd
+```{r}
+# Number of samples
+nsamples(dist.sum.git.wk5.noHD.ps)
+
+# Number of ASVs
+ntaxa(dist.sum.git.wk5.noHD.ps)
+
+# Confirm only Week 5 samples remain
+table(sample_data(dist.sum.git.wk5.noHD.ps)$Week)
+
+# Check treatment and temperature distribution
+sample_data(dist.sum.git.wk5.noHD.ps) %>%
+  data.frame() %>%
+  count(Temperature, Treatment) %>%
+  arrange(Temperature, Treatment)
+
+# Check sequencing depth
+summary(sample_sums(dist.sum.git.wk5.noHD.ps))
+```
+
+
+~ 
+RAREFACTION CURVE 
+~
+```{r}
+#curve set up
+library(phyloseq)
+library(vegan)
+
+# Week 5 subset (same as in your barplot function)
+ps_wk5 <- subset_samples(dist.sum.git.ps, Week == 5)
+ps_wk5 <- prune_taxa(taxa_sums(ps_wk5) > 0, ps_wk5)
+
+# OTU table: rarecurve() needs SAMPLES as rows
+wk5.otu <- as(otu_table(ps_wk5), "matrix")
+if (taxa_are_rows(ps_wk5)) wk5.otu <- t(wk5.otu)
+
+# metadata in the same sample order as the OTU table
+wk5.metadata <- data.frame(sample_data(ps_wk5))[rownames(wk5.otu), ]
+
+# colors by treatment
+treatment_colors <- c("ND" = "#1f78b4", "Few Small" = "#FF69B4",
+                      "Many Small" = "#33a02c", "Few Large" = "#ff7f00",
+                      "HD" = "#984ea3")
+sample_colors <- unname(treatment_colors[as.character(wk5.metadata$Treatment)])
+```
+
+```{r}
+vegan::rarecurve(
+  wk5.otu,
+  step = 1000,
+  col = sample_colors,
+  lty = ifelse(wk5.metadata$Temperature == "22", 1, 2),
+  lwd = 1.5,
+  label = FALSE,
+  xlab = "Sequencing depth (reads)",
+  ylab = "Observed ASV richness",
+  main = "Week 5 Summer rarefaction curves"
+)
+
+# vertical lines at the two candidate rarefaction depths
+abline(v = 38255, lty = 3, col = "grey40")
+
+legend("bottomright", legend = names(treatment_colors), col = treatment_colors,
+       lty = 1, lwd = 2, cex = 0.8, bty = "n", title = "Treatment")
+legend("topleft", legend = c("22°C", "26°C"), lty = c(1, 2), lwd = 2,
+       cex = 0.8, bty = "n", title = "Temperature")
+```
+saving rarefication curve for supp
+```{r}
+pdf("dist_rarefaction_curves_wk5.pdf", width = 8, height = 6)
+# for a PNG instead:
+# png("Suppl_Fig_rarefaction_curves_wk5.png", width = 8, height = 6, units = "in", res = 300)
+
+vegan::rarecurve(
+  wk5.otu,
+  step = 1000,
+  col = sample_colors,
+  lty = ifelse(wk5.metadata$Temperature == "22", 1, 2),
+  lwd = 1.5,
+  label = FALSE,
+  xlab = "Sequencing depth (reads)",
+  ylab = "Observed ASV richness",
+  main = "Week 5 Summer rarefaction curves"
+)
+
+# vertical line at the rarefaction depth
+abline(v = 38255, lty = 3, col = "grey40")
+
+legend("bottomright", legend = names(treatment_colors), col = treatment_colors,
+       lty = 1, lwd = 2, cex = 0.8, bty = "n", title = "Treatment")
+legend("topleft", legend = c("22°C", "26°C"), lty = c(1, 2), lwd = 2,
+       cex = 0.8, bty = "n", title = "Temperature")
+
+dev.off()
+```
+
+
+lowest sequencing depth sample
+```{r}
+# Find sequencing depth for every Week 5 sample
+wk5.depth <- data.frame(
+  Sample = sample_names(dist.sum.git.wk5.ps),
+  Sequencing_Depth = sample_sums(dist.sum.git.wk5.ps)
+)
+
+# Sort from lowest to highest sequencing depth
+wk5.depth <- wk5.depth %>%
+  arrange(Sequencing_Depth)
+
+# Display all samples
+wk5.depth
+
+# Display the lowest-depth sample
+wk5.depth[1, ]
+```
+
+Rarefying = a single subsampling to a specific sequencing depth that computes a value for each ASV for each sample.
+RAREFY @ at lowest depth
+```{r}
+rare.dist.sum.git.wk5.ps <- rarefy_even_depth(
+  dist.sum.git.wk5.ps,
+  sample.size = 38255,
+  rngseed = 123,
+  replace = FALSE,
+  trimOTUs = TRUE,
+  verbose = TRUE
+)
+#SAMPLE CHECK
+nsamples(rare.dist.sum.git.wk5.ps)
+summary(sample_sums(rare.dist.sum.git.wk5.ps))
+ntaxa(rare.dist.sum.git.wk5.ps)
+```
+
+Rarefaction = repeated subsampling to a specific sequencing depth that computes a single mean value for each sample @ lowest depth 
+```{r}
+#LOOP
+otu <- as(otu_table(dist.sum.git.wk5.ps), "matrix")
+if (taxa_are_rows(dist.sum.git.wk5.ps)) otu <- t(otu)      # samples x ASVs
+
+n_iter <- 100
+set.seed(123)
+
+sum_counts <- matrix(0, nrow(otu), ncol(otu), dimnames = dimnames(otu))
+alpha_arr  <- array(NA_real_, dim = c(nrow(otu), 3, n_iter),
+                    dimnames = list(rownames(otu),
+                                    c("Observed", "Shannon", "InvSimpson"), NULL))
+
+for (i in seq_len(n_iter)) {
+  r <- suppressWarnings(vegan::rrarefy(otu, sample = 38255))   # one rarefied draw
+  sum_counts <- sum_counts + r
+  alpha_arr[, "Observed",   i] <- rowSums(r > 0)
+  alpha_arr[, "Shannon",    i] <- vegan::diversity(r, "shannon")
+  alpha_arr[, "InvSimpson", i] <- vegan::diversity(r, "invsimpson")
+}
+
+# 1. averaged alpha table (one row per sample)
+alpha_rare1_avg <- as.data.frame(apply(alpha_arr, c(1, 2), mean))
+
+# 2. averaged-count phyloseq object (plots and descriptive summaries only)
+mean_counts <- sum_counts / n_iter
+rare.avg.dist.sum.git.wk5.ps <- phyloseq(
+  otu_table(mean_counts, taxa_are_rows = FALSE),
+  sample_data(dist.sum.git.wk5.ps),
+  tax_table(dist.sum.git.wk5.ps)
+)
+rare.avg.dist.sum.git.wk5.ps <- prune_taxa(
+  taxa_sums(rare.avg.dist.sum.git.wk5.ps) > 0, rare.avg.dist.sum.git.wk5.ps)
+
+#SAMPLE CHECK
+nsamples(rare.avg.dist.sum.git.wk5.ps)
+summary(sample_sums(rare.avg.dist.sum.git.wk5.ps))
+ntaxa(rare.avg.dist.sum.git.wk5.ps)
+```
+[1] 27
+   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+  38255   38255   38255   38255   38255   38255 
+[1] 13467 taxa, 38255 library size
+*for more confidence in rarefied subsampling results, rarefied 100 times and took averages
+
+
+~
+ALPHA DIVERSITY RESULTS (unrarefied data with rarefy checks!)
+~
+Making alpha dataframes for unrare and single rare  + adding in metadata
+```{r}
+make_alpha_df <- function(ps) {
+  alpha <- estimate_richness(ps, measures = c("Observed", "Shannon", "InvSimpson"))
+  alpha$Sample      <- rownames(alpha)
+  md                <- data.frame(sample_data(ps))
+  alpha$Treatment   <- md[alpha$Sample, "Treatment"]
+  alpha$Temperature <- md[alpha$Sample, "Temperature"]
+  alpha$Depth       <- as.numeric(sample_sums(ps)[alpha$Sample])
+  alpha$Evenness    <- ifelse(alpha$Observed > 1, alpha$Shannon / log(alpha$Observed), NA)
+  alpha[, c("Sample","Treatment","Temperature","Depth",
+            "Observed","Shannon","InvSimpson","Evenness")]
+}
+
+# 1. unrarefied
+alpha_unrare <- make_alpha_df(dist.sum.git.wk5.ps)
+# 2. single-draw rarefied
+alpha_rare_single <- make_alpha_df(rare.dist.sum.git.wk5.ps)
+# 3. averaged over 100 draws (reshape your loop output to match)
+md <- data.frame(sample_data(dist.sum.git.wk5.ps))
+alpha_rare_avg <- alpha_rare1_avg
+alpha_rare_avg$Sample      <- rownames(alpha_rare_avg)
+alpha_rare_avg$Treatment   <- md[alpha_rare_avg$Sample, "Treatment"]
+alpha_rare_avg$Temperature <- md[alpha_rare_avg$Sample, "Temperature"]
+alpha_rare_avg$Depth       <- 38255
+alpha_rare_avg$Evenness    <- ifelse(alpha_rare_avg$Observed > 1,
+                                     alpha_rare_avg$Shannon / log(alpha_rare_avg$Observed), NA)
+alpha_rare_avg <- alpha_rare_avg[, names(alpha_unrare)]    # same column order
+
+alpha_sets <- l255ist(unrarefied = alpha_unrare,
+                   rare_avg   = alpha_rare_avg,
+                   rare_single = alpha_rare_single)
+```
+
+```{r}
+dim(alpha_unrare)                        # should be 27 rows, 3 columns
+head(alpha_unrare)
+summary(alpha_unrare)
+all(rownames(alpha_unrare) == rownames(otu))   # TRUE: same sample order as the original table
+
+dim(alpha_rare_single)                        # should be 27 rows, 3 columns
+head(alpha_rare_single)
+summary(alpha_rare_single)
+all(rownames(alpha_rare_single) == rownames(otu))   # TRUE: same sample order as the original table
+
+dim(alpha_rare_avg)                        # should be 27 rows, 3 columns
+head(alpha_rare_avg)
+summary(alpha_rare_avg)
+all(rownames(alpha_rare_avg) == rownames(otu))   # TRUE: same sample order as the original table
+```
+Need to now drop HD for Anovas (since only present at one temperature)
+```{r}
+alpha_unrare_noHD      <- droplevels(dplyr::filter(alpha_unrare,      Treatment != "HD"))
+alpha_rare_avg_noHD    <- droplevels(dplyr::filter(alpha_rare_avg,    Treatment != "HD"))
+alpha_rare_single_noHD <- droplevels(dplyr::filter(alpha_rare_single, Treatment != "HD"))
+nrow(alpha_unrare_noHD)                                       # 24
+levels(alpha_unrare_noHD$Treatment)                           # ND, Few Small, Many Small, Few Large
+table(alpha_unrare_noHD$Temperature, alpha_unrare_noHD$Treatment)   # 3 in every cell
+```
+
+3 dataframes
+alpha_unrare_noHD  ~ unrare dataframe    
+alpha_rare_single_noHD ~ rarefy (single subsample)
+alpha_rare_avg_noHD ~  rarefication (100 subsample average)
+3 phyloseq objects
+dist.sum.git.wk5 ~ unrare
+rare.dist.sum.git.wk5.ps ~ rarefy (single subsample)
+rare.avg.dist.sum.git.wk5.ps ~  rarefication (100 subsample average)
+
+
+models! 2 way anovas unrare data
+- repeated with each alpha diversity metric (Shannon, Observed, Richness, Evenness)
+- models passed assumptions
+- no stat sig results
+```{r}
+# Two-way ANOVA
+anova.unrare <- aov(
+  Evenness ~ Treatment * Temperature,
+  data = alpha_unrare_noHD
+)
+summary(anova.unrare)
+# Assumption checks
+qqnorm(residuals(anova.unrare))
+qqline(residuals(anova.unrare), col = "red")
+shapiro.test(residuals(anova.unrare))
+leveneTest(
+  Evenness ~ Treatment * Temperature,
+  data = alpha_unrare_noHD
+)
+par(mfrow = c(1, 2))
+plot(anova.unrare, which = 1)   # residuals vs fitted: look for a funnel shape
+plot(anova.unrare, which = 2)   # Q-Q plot
+par(mfrow = c(1, 1))
+
+#effect sizes. A p-value alone says little with n=3 per cell. This adds the share of variance each term explains:
+tab <- summary(anova.unrare)[[1]]
+tab$eta_sq <- round(tab$`Sum Sq` / sum(tab$`Sum Sq`), 3)
+tab
+```
+
+models! 2 way anovas (alpha_rare_single_noHD) rarefied data (subsampled once at sample with lowest depth)
+- repeated with each alpha diversity metric (Shannon, Observed, Richness, Evenness)
+- models passed assumptions
+- no stat sig results
+```{r}
+# Two-way ANOVA
+anova.rare.sing <- aov(
+  InvSimpson ~ Treatment * Temperature,
+  data = alpha_rare_single_noHD
+)
+summary(anova.rare.sing)
+# Assumption checks
+qqnorm(residuals(anova.rare.sing))
+qqline(residuals(anova.rare.sing), col = "red")
+shapiro.test(residuals(anova.rare.sing))
+leveneTest(
+  InvSimpson ~ Treatment * Temperature,
+  data = alpha_rare_single_noHD
+)
+par(mfrow = c(1, 2))
+plot(anova.rare.sing, which = 1)   # residuals vs fitted: look for a funnel shape
+plot(anova.rare.sing, which = 2)   # Q-Q plot
+
+#effect sizes. A p-value alone says little with n=3 per cell. This adds the share of variance each term explains:
+tab <- summary(anova.rare.sing)[[1]]
+tab$eta_sq <- round(tab$`Sum Sq` / sum(tab$`Sum Sq`), 3)
+tab
+```
+
+models! 2 way anovas (alpha_rare_avg_noHD) rarification (subsamples 100 times @ lowest depth)
+ repeated with each alpha diversity metric (Shannon, Observed, Richness, Evenness)
+- models passed assumptions
+- no stat sig results
+```{r}
+# Two-way ANOVA
+anova.rare.avg <- aov(
+  Evenness ~ Treatment * Temperature,
+  data = alpha_rare_avg_noHD
+)
+summary(anova.rare.avg)
+# Assumption checks
+qqnorm(residuals(anova.rare.avg))
+qqline(residuals(anova.rare.avg), col = "red")
+shapiro.test(residuals(anova.rare.avg))
+leveneTest(
+  Evenness ~ Treatment * Temperature,
+  data = alpha_rare_avg_noHD
+)
+par(mfrow = c(1, 2))
+plot(anova.rare.avg, which = 1)   # residuals vs fitted: look for a funnel shape
+plot(anova.rare.avg, which = 2)   # Q-Q plot
+par(mfrow = c(1, 1))
+
+#effect sizes. A p-value alone says little with n=3 per cell. This adds the share of variance each term explains:
+tab <- summary(anova.rare.avg)[[1]]
+tab$eta_sq <- round(tab$`Sum Sq` / sum(tab$`Sum Sq`), 3)
+tab
+```
+
+
+CONCLUSIONS FROM ALPHA 
+Alpha diversity (Observed richness, Shannon, inverse Simpson, and Pielou’s evenness)
+- rarefied to 38,255 reads
+- rarefaction 100 times to 38,255 
+- unrare data 
+- no difference!
+- Alpha Diversity did not differ delectably among disturbance treatments or between temperatures, and there was no Treatment × Temperature interaction (all p > 0.05; n = 3 per group)
+
+
+~~
+BETA DIVERISTY
+~~
+
+Type of Data & Filter Compared Here 
+1	Unrarefied, no HD (24 mats) - 	ASVs present in at least 3 mats
+2	Unrarefied, no HD (24 mats)	 - purgeOutliers ASV rules (otu.cut 0.0001, zero.cut 0.02), sample step off (sampleZcut = -100)
+3	Rarefied (100-draw average, 38,255 reads), no HD - 	No filter
+
+*All three use CLR with a pseudocount of 1, then Euclidean distance (Aitchison).
+
+
+
+~SET UP
+FILTERED ~ More strict filter
+```{r}
+#prevalence filter!!! (keep ASVs present in at least 3 samples)
+dist.sum.git.wk5.noHD.filt.ps <- filter_taxa(
+  dist.sum.git.wk5.noHD.ps,
+  function(x) sum(x > 0) >= 3,
+  prune = TRUE
+)
+ntaxa(dist.sum.git.wk5.noHD.ps)        # before
+ntaxa(dist.sum.git.wk5.noHD.filt.ps)   # after
+sum(taxa_sums(dist.sum.git.wk5.noHD.filt.ps)) /
+  sum(taxa_sums(dist.sum.git.wk5.noHD.ps)) * 100   # % of reads kept
+```
+[1] 12602
+[1] 5554
+[1] 94.30866
+
+PURGED ~ filter schyler used (MCM.OTU) ~ package wouldnt load so used this instead
+```{r}
+#only run once 
+tmp <- tempdir()
+download.file("https://cran.r-project.org/src/contrib/Archive/MCMC.OTU/MCMC.OTU_1.0.10.tar.gz",
+              destfile = file.path(tmp, "MCMC.OTU.tar.gz"), mode = "wb")
+untar(file.path(tmp, "MCMC.OTU.tar.gz"), exdir = tmp)
+
+list.files(file.path(tmp, "MCMC.OTU", "R"))     # look for purgeOutliers.R
+source(file.path(tmp, "MCMC.OTU", "R", "purgeOutliers.R"))
+
+purgeOutliers                                    # prints the function so you can read it
+```
+
+
+```{r}
+## --- same set-up as your original script, built from your Week 5 no-HD object ---
+ps <- dist.sum.git.wk5.noHD.ps
+seqtab.cleanest <- as(otu_table(ps), "matrix")
+if (taxa_are_rows(ps)) seqtab.cleanest <- t(seqtab.cleanest)
+seqtab.cleanest <- as.data.frame(seqtab.cleanest)            # samples x ASVs
+
+nums    <- 1:nrow(seqtab.cleanest)
+samples <- rownames(seqtab.cleanest)
+int         <- cbind(sample = 0, seqtab.cleanest)
+seq.formcmc <- cbind(X = 0, int)
+seq.formcmc$X      <- nums
+seq.formcmc$sample <- samples
+dim(seq.formcmc)
+
+## --- trim underrepresented ASVs (same call as your original) ---
+seq.trim.allinfo <- purgeOutliers(seq.formcmc,
+                                  count.columns = 3:ncol(seq.formcmc),   # replaces your hard-coded 3:10011
+                                  sampleZcut = -100,                     # set to -100 to keep all 24 mats
+                                  otu.cut = 0.0001, zero.cut = 0.02)
+dim(seq.trim.allinfo)
+
+seq.trim <- seq.trim.allinfo[, 3:ncol(seq.trim.allinfo)]    # replaces your hard-coded 3:1685
+rownames(seq.trim) <- seq.trim.allinfo$sample               # keeps the sample names
+write.csv(seq.trim, file = "seqtab.trim.csv")
+seq.trim <- read.csv("seqtab.trim.csv", row.names = 1, check.names = FALSE)
+
+## --- what was removed? ---
+removed.samples <- setdiff(samples, rownames(seq.trim))
+removed.samples                                              # which mat(s), if any
+ncol(seq.trim)                                               # ASVs kept
+sum(seq.trim) / sum(seqtab.cleanest[rownames(seq.trim), ]) * 100    # % of reads kept (in the retained mats)
+
+## --- back into phyloseq ---
+dist.sum.git.wk5.noHD.purged.ps <- prune_taxa(colnames(seq.trim), ps)
+dist.sum.git.wk5.noHD.purged.ps <- prune_samples(rownames(seq.trim), dist.sum.git.wk5.noHD.purged.ps)
+sample_data(dist.sum.git.wk5.noHD.purged.ps) <-
+  sample_data(droplevels(data.frame(sample_data(dist.sum.git.wk5.noHD.purged.ps))))
+
+ntaxa(dist.sum.git.wk5.noHD.purged.ps); nsamples(dist.sum.git.wk5.noHD.purged.ps)
+table(sample_data(dist.sum.git.wk5.noHD.purged.ps)$Temperature,
+      sample_data(dist.sum.git.wk5.noHD.purged.ps)$Treatment)
+```
+- ASVs were filtered following the MCMC.OTU purgeOutliers rules: ASVs with under 0.01% of total reads, or detected in under 2% of samples, were removed. The function’s sample-level outlier rule (log total counts, z < −2.5) was not applied, to retain all replicates (also read depth for lowest depth sample is fine)
+
+Differences between 2 filters:
+- FILTER prevalence filter removes ASVs found in only 1 or 2 mats (about 56% of your ASVs) whatever their read count
+- PURGED purgeOutliers removes ASVs with under roughly 250 total reads (probably over three-quarters of them), even if they appear in many mats, and its 2% prevalence rule does almost nothing with 24 mats.
+
+FILTERED
+```{r}
+# Extract ASV table (samples as rows)
+wk5.noHD.seqtab <- as(otu_table(dist.sum.git.wk5.noHD.filt.ps), "matrix")
+if (taxa_are_rows(dist.sum.git.wk5.noHD.filt.ps)) {
+  wk5.noHD.seqtab <- t(wk5.noHD.seqtab)
+}
+
+#CLR transformation done by hand (pseudocount of 1 added before the log)
+wk5.noHD.clr.seqtab <- log(wk5.noHD.seqtab + 1)
+wk5.noHD.clr.seqtab <- wk5.noHD.clr.seqtab - rowMeans(wk5.noHD.clr.seqtab)
+
+# Calculate Euclidean distances on the CLR table ( Aitchison distance)
+wk5.noHD.dist <- vegdist(wk5.noHD.clr.seqtab, method = "euclidean")
+
+# Extract metadata
+wk5.noHD.samdf <- data.frame(sample_data(dist.sum.git.wk5.noHD.filt.ps))
+
+# Check sample alignment
+identical(rownames(wk5.noHD.samdf), labels(wk5.noHD.dist))
+```
+
+
+```{r}
+set.seed(123)
+
+# Beta dispersion by Treatment
+wk5.noHD.betadisper.treatment <- betadisper(wk5.noHD.dist, wk5.noHD.samdf$Treatment, bias.adjust = TRUE)
+anova(wk5.noHD.betadisper.treatment)
+permutest(wk5.noHD.betadisper.treatment, pairwise = TRUE, permutations = 9999)
+
+# Beta dispersion by Temperature
+wk5.noHD.betadisper.temperature <- betadisper(wk5.noHD.dist, wk5.noHD.samdf$Temperature,  bias.adjust = TRUE)
+anova(wk5.noHD.betadisper.temperature)
+permutest(wk5.noHD.betadisper.temperature, pairwise = TRUE, permutations = 9999)
+
+#beta dispersion across all 8 Treatment x Temperature groups
+wk5.noHD.samdf$Group <- interaction(wk5.noHD.samdf$Treatment, wk5.noHD.samdf$Temperature,  bias.adjust = TRUE)
+wk5.noHD.betadisper.group <- betadisper(wk5.noHD.dist, wk5.noHD.samdf$Group)
+permutest(wk5.noHD.betadisper.group, permutations = 9999)
+```
+Dispersion looks fine
+
+```{r}
+set.seed(123)
+# "margin" tests the interaction first
+wk5.noHD.adonis.asv.margin <- adonis2(
+  wk5.noHD.dist ~ Treatment * Temperature,
+  data = wk5.noHD.samdf,
+  permutations = 9999,
+  by = "margin"
+)
+wk5.noHD.adonis.asv.margin
+```
+
+```{r}
+set.seed(123)
+#  if!! the interaction isn't supported, read the main effects from this additive model
+wk5.noHD.adonis.asv.additive <- adonis2(
+  wk5.noHD.dist ~ Treatment + Temperature,
+  data = wk5.noHD.samdf,
+  permutations = 9999,
+  by = "margin"
+)
+wk5.noHD.adonis.asv.additive
+```
+Temperature effect seen for filtered data! 
+Temperature  1    13363 0.06160 1.4524 0.0486 *
+
+~
+PURGED
+```{r}
+# Extract ASV table (samples as rows)
+wk5.noHD.purged.seqtab <- as(otu_table(dist.sum.git.wk5.noHD.purged.ps), "matrix")
+if (taxa_are_rows(dist.sum.git.wk5.noHD.purged.ps)) {
+  wk5.noHD.purged.seqtab <- t(wk5.noHD.purged.seqtab)
+}
+
+# CLR transformation done by hand (pseudocount of 1 added before the log)
+wk5.noHD.purged.clr.seqtab <- log(wk5.noHD.purged.seqtab + 1)
+wk5.noHD.purged.clr.seqtab <- wk5.noHD.purged.clr.seqtab - rowMeans(wk5.noHD.purged.clr.seqtab)
+
+# Euclidean distances on the CLR table (Aitchison distance)
+wk5.noHD.purged.dist <- vegdist(wk5.noHD.purged.clr.seqtab, method = "euclidean")
+
+# Extract metadata
+wk5.noHD.purged.samdf <- data.frame(sample_data(dist.sum.git.wk5.noHD.purged.ps))
+
+# Check sample alignment
+identical(rownames(wk5.noHD.purged.samdf), labels(wk5.noHD.purged.dist))
+nsamples(dist.sum.git.wk5.noHD.purged.ps)     # should be 24
+```
+
+```{r}
+set.seed(123)
+
+# Beta dispersion by Treatment
+purged.wk5.noHD.betadisper.treatment <- betadisper(wk5.noHD.purged.dist, wk5.noHD.purged.samdf$Treatment, bias.adjust = TRUE)
+anova(purged.wk5.noHD.betadisper.treatment)
+permutest(purged.wk5.noHD.betadisper.treatment, pairwise = TRUE, permutations = 9999)
+
+# Beta dispersion by Temperature
+purged.wk5.noHD.betadisper.temperature <- betadisper(wk5.noHD.purged.dist, wk5.noHD.purged.samdf$Temperature, bias.adjust = TRUE)
+anova(purged.wk5.noHD.betadisper.temperature)
+permutest(purged.wk5.noHD.betadisper.temperature, pairwise = TRUE, permutations = 9999)
+
+#beta dispersion across all 8 Treatment x Temperature groups
+wk5.noHD.purged.samdf$Group <- interaction(wk5.noHD.purged.samdf$Treatment, wk5.noHD.purged.samdf$Temperature, bias.adjust = TRUE)
+purged.wk5.noHD.betadisper.group <- betadisper(wk5.noHD.purged.dist, wk5.noHD.purged.samdf$Group)
+permutest(purged.wk5.noHD.betadisper.group, permutations = 9999)
+```
+dispersion looks fine
+
+```{r}
+set.seed(123)
+# "margin" tests the interaction first
+purge.wk5.noHD.adonis.asv.margin <- adonis2(
+  wk5.noHD.purged.dist ~ Treatment * Temperature,
+  data = wk5.noHD.purged.samdf,
+  permutations = 9999,
+  by = "margin"
+)
+purge.wk5.noHD.adonis.asv.margin
+```
+
+```{r}
+set.seed(123)
+#  if!! the interaction isn't supported, read the main effects from this additive model
+purge.wk5.noHD.adonis.asv.additive <- adonis2(
+  wk5.noHD.purged.dist ~ Treatment + Temperature,
+  data = wk5.noHD.purged.samdf,
+  permutations = 9999,
+  by = "margin"
+)
+purge.wk5.noHD.adonis.asv.additive
+```
+Temperature  1     7185 0.06493 1.5360  0.055 
+same affect size but no longer stat sig.
+
+
+RAREFIED
+```{r}
+#removing HD from rarefied (100 random subsampled) phyloseq object 
+rare.avg.dist.sum.git.wk5.noHD.ps <- subset_samples(rare.avg.dist.sum.git.wk5.ps, Treatment != "HD")
+rare.avg.dist.sum.git.wk5.noHD.ps <- prune_taxa(taxa_sums(rare.avg.dist.sum.git.wk5.noHD.ps) > 0,
+                                                rare.avg.dist.sum.git.wk5.noHD.ps)
+sample_data(rare.avg.dist.sum.git.wk5.noHD.ps) <-
+  sample_data(droplevels(data.frame(sample_data(rare.avg.dist.sum.git.wk5.noHD.ps))))
+#set up for beta dispersion/diversity
+# Extract ASV table (samples as rows)
+wk5.noHD.rare.avg.seqtab <- as(otu_table(rare.avg.dist.sum.git.wk5.noHD.ps), "matrix")
+if (taxa_are_rows(rare.avg.dist.sum.git.wk5.noHD.ps)) {
+  wk5.noHD.rare.avg.seqtab <- t(wk5.noHD.rare.avg.seqtab)
+}
+
+# CLR transformation done by hand (pseudocount of 1 added before the log)
+wk5.noHD.rare.avg.clr.seqtab <- log(wk5.noHD.rare.avg.seqtab + 1)
+wk5.noHD.rare.avg.clr.seqtab <- wk5.noHD.rare.avg.clr.seqtab - rowMeans(wk5.noHD.rare.avg.clr.seqtab)
+
+# Euclidean distances on the CLR table (Aitchison distance)
+wk5.noHD.rare.avg.dist <- vegdist(wk5.noHD.rare.avg.clr.seqtab, method = "euclidean")
+
+# Extract metadata
+wk5.noHD.rare.avg.samdf <- data.frame(sample_data(rare.avg.dist.sum.git.wk5.noHD.ps))
+
+# Check sample alignment
+identical(rownames(wk5.noHD.rare.avg.samdf), labels(wk5.noHD.rare.avg.dist))
+nsamples(rare.avg.dist.sum.git.wk5.noHD.ps)     # should be 24
+```
+
+```{r}
+set.seed(123)
+
+# Beta dispersion by Treatment
+rare.wk5.noHD.betadisper.treatment <- betadisper(wk5.noHD.rare.avg.dist, wk5.noHD.rare.avg.samdf$Treatment, bias.adjust = TRUE)
+anova(rare.wk5.noHD.betadisper.treatment)
+permutest(rare.wk5.noHD.betadisper.treatment, pairwise = TRUE, permutations = 9999)
+
+# Beta dispersion by Temperature
+rare.wk5.noHD.betadisper.temperature <- betadisper(wk5.noHD.rare.avg.dist, wk5.noHD.rare.avg.samdf$Temperature, bias.adjust = TRUE)
+anova(rare.wk5.noHD.betadisper.temperature)
+permutest(rare.wk5.noHD.betadisper.temperature, pairwise = TRUE, permutations = 9999)
+
+#beta dispersion across all 8 Treatment x Temperature groups
+wk5.noHD.rare.avg.samdf$Group <- interaction(wk5.noHD.rare.avg.samdf$Treatment, wk5.noHD.rare.avg.samdf$Temperature, bias.adjust = TRUE)
+rare.wk5.noHD.betadisper.group <- betadisper(wk5.noHD.rare.avg.dist, wk5.noHD.rare.avg.samdf$Group)
+permutest(rare.wk5.noHD.betadisper.group, permutations = 9999)
+```
+dispersion looks good 
+
+```{r}
+set.seed(123)
+# "margin" tests the interaction first
+rare.wk5.noHD.adonis.asv.margin <- adonis2(
+  wk5.noHD.rare.avg.dist ~ Treatment * Temperature,
+  data = wk5.noHD.rare.avg.samdf,
+  permutations = 9999,
+  by = "margin"
+)
+rare.wk5.noHD.adonis.asv.margin
+```
+
+```{r}
+set.seed(123)
+#  if!! the interaction isn't supported, read the main effects from this additive model
+rare.wk5.noHD.adonis.asv.additive <- adonis2(
+  wk5.noHD.rare.avg.dist ~ Treatment + Temperature,
+  data = wk5.noHD.rare.avg.samdf,
+  permutations = 9999,
+  by = "margin"
+)
+rare.wk5.noHD.adonis.asv.additive
+```
+*rarefied data ~ temp has an effect 
+Temperature  1     8516 0.06088 1.4364 0.0382 *
+
+Analysis	Temperature R²	p
+(1) CLR, prevalence ≥ 3, unrarefied	  0.062	0.049*
+(2) CLR, purgeOutliers, unrarefied  	0.065	0.055
+(3) CLR, rarefied average, no filter	0.061	0.038*
+
+~
+Beta diversity results summary
+~
+*The effect size doesn’t change. R² is 0.06 to 0.07 in every analysis
+*Temperature explains about 6 to 7% of community variation however you filter or normalize.
+*Primary: (1), prevalence-filtered, unrarefied - filter rule is easy to justify. 
+
+*Temperature explained about 6% of the variation in community composition (PERMANOVA on CLR-transformed ASV abundances, R² = 0.062, p = 0.049). Results were similar across filtering and normalization choices (R² = 0.060–0.069; p = 0.027–0.055m indicating a small and borderline effect. Disturbance treatment and the Treatment × Temperature interaction were not supported
+
+~
+PCOA PLOTS
+~
+```{r}
+library(ggplot2); library(cowplot); library(ggrepel)
+
+
+# ---------- PCoA of the prevalence-filtered CLR/Euclidean distances (set 1) ----------
+stopifnot(ncol(wk5.noHD.clr.seqtab) == ntaxa(dist.sum.git.wk5.noHD.filt.ps))   # confirms this is the filtered set
+stopifnot(identical(rownames(wk5.noHD.samdf), labels(wk5.noHD.dist)))
+
+wk5.noHD.pcoa <- ape::pcoa(wk5.noHD.dist)
+wk5.noHD.pcoa.percent <- round(wk5.noHD.pcoa$values$Relative_eig * 100, 1)
+wk5.noHD.pcoa.df <- cbind(
+  data.frame(PCoA1 = wk5.noHD.pcoa$vectors[, 1],
+             PCoA2 = wk5.noHD.pcoa$vectors[, 2]),
+  wk5.noHD.samdf
+)
+
+# shared look for both panels
+temp_cols  <- c("22" = "blue3", "26" = "red3")
+base_theme <- theme_classic(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 12))
+
+xlab <- paste0("PCoA 1 (", wk5.noHD.pcoa.percent[1], "%)")
+ylab <- paste0("PCoA 2 (", wk5.noHD.pcoa.percent[2], "%)")
+
+# ---------- Panel A: ASV-level PCoA, shaded Temperature ellipses, no arrows ----------
+pA <- ggplot(wk5.noHD.pcoa.df,
+             aes(x = PCoA1, y = PCoA2, color = Temperature, shape = Treatment)) +
+  stat_ellipse(aes(group = Temperature, fill = Temperature),
+               geom = "polygon", level = 0.95,
+               alpha = 0.18, color = NA, show.legend = FALSE) +
+    geom_point(size = 3.5, alpha = 0.85) +
+  scale_color_manual(values = temp_cols) +
+  scale_shape_manual(values = c("ND" = 16, "Few Small" = 17,
+                                "Many Small" = 15, "Few Large" = 18)) +
+  scale_fill_manual(values = temp_cols) +
+  scale_fill_manual(values = temp_cols) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.05, vjust = 1.5, size = 3.5,
+           label = "Temperature: R² = 0.062, p = 0.049") +
+  labs(title = "ASV profiles: CLR/Euclidean PCoA", x = xlab, y = ylab) +
+  base_theme
+
+# ---------- Class arrows (descriptive overlay only; axes stay ASV-level) ----------
+cls.ps <- dist.sum.git.wk5.noHD.filt.ps
+
+# ASV count table with samples as rows
+asv <- as(otu_table(cls.ps), "matrix")
+if (taxa_are_rows(cls.ps)) asv <- t(asv)
+
+# Class name for each ASV; unassigned ASVs are pooled together
+cls <- as.character(tax_table(cls.ps)[colnames(asv), "Class"])
+cls[is.na(cls) | trimws(cls) == ""] <- "Unassigned"
+
+# sum ASV counts within each Class -> samples x Classes
+class.counts <- t(rowsum(t(asv), group = cls))
+
+# match the sample order used in the PCoA
+class.counts <- class.counts[rownames(wk5.noHD.samdf), ]
+
+stopifnot(identical(rownames(class.counts), rownames(wk5.noHD.samdf)))
+
+keep.cls  <- colSums(class.counts > 0) >= 3
+clr.class <- log(class.counts[, keep.cls] + 1)
+clr.class <- clr.class - rowMeans(clr.class)
+
+# arrow = correlation of each Class's CLR abundance with the two plotted PCoA axes
+# (same vectors vegan::envfit would draw); longer arrow = Class lines up better with this plane
+ax   <- as.matrix(wk5.noHD.pcoa.df[, c("PCoA1", "PCoA2")])
+cors <- cor(clr.class, ax)
+len  <- sqrt(rowSums(cors^2))
+
+# optional: only consider common Classes (mean relative abundance >= 1%) to avoid chance hits among rare ones
+# common <- colMeans(class.counts / rowSums(class.counts)) >= 0.01
+# len <- len[names(len) %in% names(common)[common]]
+
+top  <- names(sort(len, decreasing = TRUE))[1:10]
+mult <- 0.8 * min(max(abs(ax[, 1])) / max(abs(cors[top, 1])),
+                  max(abs(ax[, 2])) / max(abs(cors[top, 2])))
+arrow.df <- data.frame(Class = top,
+                       PCoA1 = cors[top, 1] * mult,
+                       PCoA2 = cors[top, 2] * mult)
+
+# ---------- Panel B: same ASV-level PCoA + Class arrows ----------
+pB <- ggplot(wk5.noHD.pcoa.df,
+             aes(x = PCoA1, y = PCoA2, color = Temperature, shape = Treatment)) +
+  geom_segment(data = arrow.df, aes(x = 0, y = 0, xend = PCoA1, yend = PCoA2),
+               inherit.aes = FALSE, color = "grey40",
+               arrow = arrow(length = unit(0.2, "cm"))) +
+  geom_point(size = 3.5, alpha = 0.85) +
+  ggrepel::geom_text_repel(data = arrow.df, aes(x = PCoA1, y = PCoA2, label = Class),
+                           inherit.aes = FALSE, size = 0, color = "grey20",
+                           max.overlaps = Inf) +
+  scale_color_manual(values = temp_cols) +
+    geom_point(size = 3.5, alpha = 0.85) +
+  scale_color_manual(values = temp_cols) +
+  scale_shape_manual(values = c("ND" = 16, "Few Small" = 17,
+                                "Many Small" = 15, "Few Large" = 18)) +
+  scale_fill_manual(values = temp_cols) +
+  labs(title = "Same PCoA with Class arrows (exploratory)", x = xlab, y = ylab) +
+  base_theme
+
+# ---------- Combine with cowplot, one shared legend ----------
+legend <- cowplot::get_legend(pA)
+panels <- cowplot::plot_grid(pA + theme(legend.position = "none"),
+                             pB + theme(legend.position = "none"),
+                             labels = c("A", "B"), label_size = 14, nrow = 1,
+                             align = "hv", axis = "tblr")
+final.fig <- cowplot::plot_grid(panels, legend, nrow = 1, rel_widths = c(1, 0.14))
+final.fig
+
+#ggsave("Week5_beta_diversity_two_panel_nolab.pdf", final.fig, width = 10, height = 5)
+```
+
+
+~
+DIFF ABUNDANCE RESULTS 
+~
+```{r}
+#could do interaction instead of (+)
+#decided not to since no interaction in alpha/beta stats
+#levels(sample_data(dist.sum.git.wk5.noHD.ps)$Treatment)   # ND should come first
+
+#primary temp ~ looking at temp and treatment, grouped by temperature
+#can keep sturctural zero because larger sample size 
+set.seed(123)
+ancom.temp <- ancombc2(
+  data = dist.sum.git.wk5.noHD.ps, assay_name = NULL, tax_level = "Class",
+  fix_formula = "Treatment + Temperature", rand_formula = NULL,
+  p_adj_method = "holm", pseudo_sens = TRUE,
+  prv_cut = 0.125, lib_cut = 0, s0_perc = 0.05,
+  group = "Temperature", struc_zero = TRUE, neg_lb = FALSE, alpha = 0.05,
+  global = FALSE, pairwise = FALSE, dunnet = FALSE, trend = FALSE,
+  n_cl = 6, verbose = TRUE)
+saveRDS(ancom.temp, "ancom_temp_holm.rds")
+
+#looking at temp & treatment ~ grouped by Treatment, with global/pairwise/Dunnett tests 
+set.seed(123)
+ancom.trt <- ancombc2(
+  data = dist.sum.git.wk5.noHD.ps, assay_name = NULL, tax_level = "Class",
+  fix_formula = "Treatment + Temperature", rand_formula = NULL,
+  p_adj_method = "holm", pseudo_sens = TRUE,
+  prv_cut = 0.125, lib_cut = 0, s0_perc = 0.05,
+  group = "Treatment", struc_zero = FALSE, neg_lb = FALSE, alpha = 0.05,
+  global = TRUE, pairwise = TRUE, dunnet = TRUE, trend = FALSE,
+  n_cl = 6, verbose = TRUE)
+saveRDS(ancom.trt, "ancom_trt_holm.rds")
+
+#third model ~ looking between treatments JUST at 22 (so can include HD treatment)
+ps22 <- subset_samples(dist.sum.git.wk5.ps, Temperature == "22")
+ps22 <- prune_taxa(taxa_sums(ps22) > 0, ps22)
+sample_data(ps22) <- sample_data(droplevels(data.frame(sample_data(ps22))))
+table(sample_data(ps22)$Treatment)       # 3 in each of 5 treatments
+levels(sample_data(ps22)$Treatment)      # ND first
+
+set.seed(123)
+ancom.trt22 <- ancombc2(
+  data = ps22, assay_name = NULL, tax_level = "Class",
+  fix_formula = "Treatment", rand_formula = NULL,
+  p_adj_method = "holm", pseudo_sens = TRUE,
+  prv_cut = 0.2, lib_cut = 0, s0_perc = 0.05,
+  group = "Treatment", struc_zero = FALSE, neg_lb = FALSE, alpha = 0.05,
+  global = TRUE, pairwise = TRUE, dunnet = TRUE, trend = FALSE,
+  n_cl = 6, verbose = TRUE)
+saveRDS(ancom.trt22, "ancom_trt22_holm.rds")
+```
+
+Exploring Diff Abundant Outputs:
+```{r}
+ancom.temp  <- readRDS("ancom_temp_holm.rds")
+ancom.trt   <- readRDS("ancom_trt_holm.rds")
+ancom.trt22 <- readRDS("ancom_trt22_holm.rds")
+```
+
+Temp model
+- since only 2 temps no global results 
+- since only 2 temps, yes to structural zero analyses
+- no sig results, no sensitivity checks needed 
+```{r}
+res.temp <- ancom.temp$res
+colnames(res.temp)                    # check exact column names
+
+# keep only the Temperature columns
+temp.cols <- c("taxon", grep("Temperature", colnames(res.temp), value = TRUE))
+res.temp.T <- res.temp[, temp.cols]
+res.temp.T <- res.temp.T[order(res.temp.T$p_Temperature26), ]
+head(res.temp.T, 15)
+
+# significant after Holm correction
+res.temp.T[res.temp.T$diff_Temperature26, ]
+```
+```{r}
+sz <- ancom.temp$zero_ind
+sz[rowSums(sz[, -1]) > 0, ]
+
+
+#write.csv(sz, "dist_ancom_temp_structural_zeros.csv", row.names = FALSE)
+```
+Treatment model
+- no differences (global result)
+- dunnett test - looks at each test against the ND treatment (no results)
+- pairwise - looks between each treatments (no results)
+- no structural zeros here 
+```{r}
+#global test ~ no differences
+glob <- ancom.trt$res_global
+glob <- glob[order(glob$p_val), ]
+head(glob, 15)
+glob[glob$diff_abn, ]            # significant Classes
+```
+
+```{r}
+#dunnett type tests ~ each treatment against ND ~ no differences
+dunn <- ancom.trt$res_dunn
+colnames(dunn)
+dunn[rowSums(dunn[, grep("^diff_", colnames(dunn))]) > 0, ]
+```
+
+```{r}
+#pairwise ~ each pair of treatments ~ no differences
+pair <- ancom.trt$res_pair
+colnames(pair)
+pair[rowSums(pair[, grep("^diff_", colnames(pair))]) > 0, ]
+```
+Treatment only at 22 Model (with HD)
+```{r}
+glob <- ancom.trt22$res_global
+glob <- glob[order(glob$p_val), ]
+head(glob, 15)
+glob[glob$diff_abn, ]            # significant Classes
+```
+
+
+```{r}
+#Dunnett ~ all against ND
+#dunnett type tests ~ each treatment against ND ~ no differences
+dunn <- ancom.trt22$res_dunn
+colnames(dunn)
+dunn[rowSums(dunn[, grep("^diff_", colnames(dunn))]) > 0, ]
+```
+
+SENSITIVITY TESTS
+```{r}
+sens <- ancom.temp$pseudo_sens_tab
+head(sens)
+```
+
+
+Final Thoughts
+-- The data checks:  ASV table match the DADA2 output, the taxonomy and cleanup are verified, and 3 independent mats for each experimental group
+- Alpha diversity was done on rarefied, rarefaction (100 subsamples) and unrarefied data (all the same results)
+- Beta diversity used FILTERED, PURGED AND RAREFIED data - all data CLR transformed & euclidean distances used 
+- Differential abundance uses raw counts (Temperature + Treatment)
+- The results agree across approaches: alpha diversity was null in every rarefied model, and beta analyses put Temperature at about 6 to 7% of variation (slight affect), with no interaction and no sign of unequal dispersion.
+- Diff abundance results ~ only 3 mats per treat x temp group & strict holm correction, no sig classes makes sense. 
+
+SOME NOTES/SUPPORT
+- Weiss et al. 2017, Schloss 2024
+https://benjjneb.github.io/dada2/tutorial_1_8.html
+https://scholar.google.com/scholar?hl=en&as_sdt=0%2C34&q=rarefying+microbiome+data&oq=rarefying+
+https://astrobiomike.github.io/amplicon/dada2_workflow_ex
+https://github.com/schyells/DNA_Metabarcoding_Analysis/blob/main/Dada2_Analysis.R
+https://www.nature.com/articles/s41598-024-77864-y
+
+
+***NOTE: for next experiment, temp reps were kept in the same tank, should account for that 
+**Upload code to Github, download important figures/dataframes
+
+~
+PAM/NUTRIENT RESULTS (can redo as a sanity check)
+~
+PAM 
+```{r}
+pam <- read.csv("PAM3.csv")
+View(pam)
+```
+
+```{r}
+#filter by experiment
+sumpam <- pam[pam$Experiment == "Summer", ]
+fieldpam <- pam[pam$Experiment == "Field", ]
+temppam <- pam[pam$Experiment == "Temp", ]
+```
+
+```{r}
+sumpam <- sumpam[-c(13:15, 31:33), ]
+sumpam <- sumpam[, -c(3,5)]
+View(sumpam)
+```
+
+Summer PAM
+-passed assumptions, no differences in pam between temperature or disturbance treatment
+```{r}
+#2 way anova
+#maximal model
+sumpam1 <- aov(pam ~ Treatment * Temperature, data = sumpam)
+summary(sumpam1)
+
+#checkassumptions
+#(1)normality
+qqnorm(residuals(sumpam1))
+qqline(residuals(sumpam1), col = "red")
+shapiro_test <- shapiro.test(residuals(sumpam1))
+print(shapiro_test)
+#(2)homogeneity
+sumpam$Temperature <- as.factor(sumpam$Temperature)
+sumpam$Treatment <- as.factor(sumpam$Treatment)
+levene_test <- leveneTest(pam ~ Treatment * Temperature, data = sumpam)
+print(levene_test)
+# (3) linearity~ Visual check: residuals vs fitted
+plot(fitted(sumpam1), residuals(sumpam1),
+     xlab = "Fitted values",
+     ylab = "Residuals",
+     main = "Residuals vs Fitted")
+abline(h = 0, col = "red")
+# Look for random scatter around zero
+
+```

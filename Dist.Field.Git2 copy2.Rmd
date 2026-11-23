@@ -1,0 +1,868 @@
+---
+title: "Dist.Field.Git2.Rmd"
+output: html_document
+date: "2026-11-18"
+---
+
+libs:
+libraries:
+```{r}
+library(ggnewscale)
+library(ggplot2)
+library(cowplot)
+library(phyloseq)
+library(car)
+library(ggpubr)
+library(vegan) #vegan 2.6-4
+library(dada2)
+library(RColorBrewer)
+library(dplyr)
+library(tidyverse)
+library(stringr)
+library(dplyr)
+library(stats)
+library(ggplot2)
+library(ggpubr)
+library(vegan)
+library(cowplot)
+library(tidyverse)
+library(phyloseq)
+library(microbiome)
+library("funfuns")
+library(pairwiseAdonis)
+library(viridis)
+library("microViz")
+library(ape)
+```
+setting up 
+```{r}
+# ---- libraries (once) ----
+library(tidyverse)      # dplyr, ggplot2, stringr, tidyr
+library(phyloseq); library(vegan); library(microbiome); library(microViz)
+library(car); library(ggpubr); library(cowplot); library(viridis); library(ape)
+library(pairwiseAdonis); library(ANCOMBC)
+set.seed(123)
+
+# ---- read, remove 0 asvs across all samples, subset to field----
+ps.cleaner <- readRDS("CH4_ps.cleaner.RDS")
+ps.cleaner.filtered <- prune_taxa(taxa_sums(ps.cleaner) > 0, ps.cleaner)
+
+dist.field.git.ps <- subset_samples(ps.cleaner.filtered, Experiment == "Field")
+dist.field.git.ps <- prune_taxa(taxa_sums(dist.field.git.ps) > 0, dist.field.git.ps)
+
+# ---- rename 7th colomn of tax table to sequence ----
+tt <- tax_table(dist.field.git.ps); colnames(tt)[7] <- "Sequence"
+tax_table(dist.field.git.ps) <- tt
+
+# ---- metadata clean-up ----
+sd <- data.frame(sample_data(dist.field.git.ps))
+sd$is.neg <- NULL
+unique(sd$Treatment)              # check raw labels before factoring
+sd$Treatment <- factor(sd$Treatment,
+                       levels = c("ND","Few Small","Many Small","HD"))
+stopifnot(!anyNA(sd$Treatment))
+sd$Treatment <- droplevels(sd$Treatment)
+sample_data(dist.field.git.ps) <- sample_data(sd)
+nsamples(dist.field.git.ps)
+ntaxa(dist.field.git.ps)
+# ---- samples per treatment ----
+table(sd$Treatment)
+```
+```{r}
+sample_sums(dist.field.git.ps) #reads per sample
+```
+
+[1] "ND" "Many Small" "Few Small" "HD"        
+[1] 19 #samples
+[1] 8623#asvs 
+
+ ND  Few Small Many Small         HD 
+5          4          5          5 
+
+~ 5th few small sample lost through library prep
+
+~~
+BAR PLOTS
+~~
+average across each sample, per experiment
+
+```{r}
+make_tax_plot_field <- function(ps, tax_rank, rare_cutoff = 1,
+                                trt_levels = c("ND", "Few Small", "Many Small", "HD")) {
+
+  # 1. Drop ASVs with zero reads (single timepoint, no Week subset needed)
+  ps <- prune_taxa(taxa_sums(ps) > 0, ps)
+
+  # 2. Aggregate ASVs at selected taxonomic level
+  ps_tax <- tax_glom(ps, taxrank = tax_rank, NArm = FALSE)
+
+  # 3. Relative abundance within each sample
+  ps_rel <- transform_sample_counts(ps_tax, function(x) x / sum(x))
+
+  # 4. Convert to dataframe
+  field_df <- psmelt(ps_rel)
+  field_df$Taxon <- as.character(field_df[[tax_rank]])
+
+  # 5. Max Treatment-group mean per taxon (used for the rare cutoff)
+  taxon_overall <- field_df %>%
+    group_by(Sample, Treatment, Taxon) %>%
+    summarise(Ab = sum(Abundance), .groups = "drop") %>%
+    group_by(Treatment, Taxon) %>%
+    summarise(Group_Mean = mean(Ab) * 100, .groups = "drop") %>%
+    group_by(Taxon) %>%
+    summarise(Mean_Percentage = max(Group_Mean), .groups = "drop")
+
+  # 6. Group unassigned and rare taxa
+  field_df <- field_df %>%
+    left_join(taxon_overall, by = "Taxon") %>%
+    mutate(
+      Taxon_grouped = case_when(
+        is.na(Taxon) | trimws(Taxon) == "" |
+          tolower(trimws(Taxon)) %in% c("na", "unclassified", "unknown") ~
+          paste("Unassigned at", tax_rank, "level"),
+        Mean_Percentage < rare_cutoff ~ "Rare taxa",
+        TRUE ~ Taxon
+      )
+    )
+
+  # 7. Combine taxa within each sample
+  field_sample_df <- field_df %>%
+    group_by(Sample, Treatment, Taxon_grouped) %>%
+    summarise(Relative_Abundance = sum(Abundance), .groups = "drop") %>%
+    mutate(Treatment = factor(Treatment, levels = trt_levels),
+           Percentage = Relative_Abundance * 100)
+
+  # 8. Average across replicates within each Treatment
+  field_summary <- field_sample_df %>%
+    group_by(Treatment, Taxon_grouped) %>%
+    summarise(Mean_Relative_Abundance = mean(Relative_Abundance), .groups = "drop") %>%
+    mutate(
+      Treatment = factor(Treatment, levels = trt_levels),
+      Mean_Percentage = Mean_Relative_Abundance * 100
+    )
+
+  # 9. Set up colors
+  taxon_levels <- unique(as.character(field_summary$Taxon_grouped))
+  distinct_palette <- c(
+    "#1f78b4", "#FF69B4", "#33a02c", "#ff7f00", "#984ea3", "#e41a1c",
+    "#4ea3d9", "#b07cc6", "#66c2a5", "#a65628", "#f781bf", "#238b45",
+    "#6a3d9a", "#e6ab02", "#00a6d6", "#d95f02", "#8c6bb1", "#41ae76",
+    "#fb6a4a", "#377eb8", "#cab2d6", "#b15928", "#74c476", "#e7298a",
+    "#ffd92f", "#006d2c", "#a6cee3", "#d4b9da", "#ff9933", "#7b3294"
+  )
+  special_colors <- c("Rare taxa" = "grey70")
+  special_colors[paste("Unassigned at", tax_rank, "level")] <- "darkblue"
+  regular_taxa <- setdiff(taxon_levels, names(special_colors))
+
+  if (length(regular_taxa) > length(distinct_palette)) {
+    message(length(regular_taxa), " taxa but only ", length(distinct_palette),
+            " colors: colors will repeat. Consider rare_cutoff > 0.")
+  }
+  regular_colors <- setNames(
+    rep(distinct_palette, length.out = length(regular_taxa)),
+    regular_taxa
+  )
+  taxon_colors <- c(regular_colors, special_colors)
+
+  shared_theme <- theme_bw() +
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.key.height = grid::unit(0.4, "cm"),
+      strip.text = element_text(face = "bold"),
+      axis.text = element_text(color = "black"),
+      plot.title = element_text(face = "bold", hjust = 0.5)
+    )
+
+  # 10a. Mean bar per Treatment
+  field_plot <- ggplot(
+    field_summary,
+    aes(x = Treatment, y = Mean_Percentage, fill = Taxon_grouped)
+  ) +
+    geom_col(color = "white", linewidth = 0.15) +
+    scale_fill_manual(values = taxon_colors, breaks = taxon_levels, drop = FALSE) +
+    scale_y_continuous(breaks = seq(0, 100, 20)) +
+    coord_cartesian(ylim = c(0, 100), expand = FALSE) +
+    labs(x = "Treatment", y = "Mean Relative Abundance (%)",
+         fill = tax_rank,
+         title = paste("Field Microbial Community:", tax_rank)) +
+    shared_theme
+
+  # 10b. One bar per sample, faceted by Treatment (shows replicate variation)
+  sample_plot <- ggplot(
+    field_sample_df,
+    aes(x = Sample, y = Percentage, fill = Taxon_grouped)
+  ) +
+    geom_col(color = "white", linewidth = 0.15) +
+    facet_grid(~ Treatment, scales = "free_x", space = "free_x") +
+    scale_fill_manual(values = taxon_colors, breaks = taxon_levels, drop = FALSE) +
+    scale_y_continuous(breaks = seq(0, 100, 20)) +
+    coord_cartesian(ylim = c(0, 100), expand = FALSE) +
+    labs(x = "Sample", y = "Relative Abundance (%)",
+         fill = tax_rank,
+         title = paste("Field Microbial Community by Sample:", tax_rank)) +
+    shared_theme +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+  list(
+    aggregated = ps_tax,
+    dataframe = field_df,
+    sample_summary = field_sample_df,
+    summary = field_summary,
+    colors = taxon_colors,
+    plot = field_plot,
+    sample_plot = sample_plot
+  )
+}
+```
+
+```{r}
+phylum.rare <- make_tax_plot_field(dist.field.git.ps, "Phylum", rare_cutoff = 1)
+phylum.all  <- make_tax_plot_field(dist.field.git.ps, "Phylum", rare_cutoff = 0)
+class.rare  <- make_tax_plot_field(dist.field.git.ps, "Class",  rare_cutoff = 1)
+class.all   <- make_tax_plot_field(dist.field.git.ps, "Class",  rare_cutoff = 0)
+
+phylum.rare$plot; phylum.all$plot; class.rare$plot; class.all$plot
+phylum.rare$sample_plot; class.rare$sample_plot
+
+# CHECK: every Treatment bar should total 100
+lapply(list(phylum.rare = phylum.rare, phylum.all = phylum.all,
+            class.rare = class.rare, class.all = class.all), function(x)
+  x$summary %>% group_by(Treatment) %>%
+    summarise(total = sum(Mean_Percentage), .groups = "drop") %>%
+    pull(total) %>% range())
+
+# Mean relative abundance tables (overall, across all 19 samples)
+phylum.all$sample_summary %>% group_by(Taxon_grouped) %>%
+  summarise(Mean_Relative_Abundance = mean(Relative_Abundance) * 100) %>%
+  arrange(desc(Mean_Relative_Abundance))
+
+class.all$sample_summary %>% group_by(Taxon_grouped) %>%
+  summarise(Mean_Relative_Abundance = mean(Relative_Abundance) * 100) %>%
+  arrange(desc(Mean_Relative_Abundance))
+
+# Save
+#ggsave("Field_Top_Phyla.pdf",          phylum.rare$plot,        width = 8,  height = 7)
+#ggsave("Field_All_Phyla.pdf",          phylum.all$plot,         width = 14, height = 7)
+#ggsave("Field_Top_Classes.pdf",        class.rare$plot,         width = 8,  height = 7)
+#ggsave("Field_All_Classes.pdf",        class.all$plot,          width = 18, height = 7)
+#ggsave("Field_Top_Classes_bySample.pdf", class.rare$sample_plot, width = 12, height = 7)
+```
+
+~
+RAREFACTION CURVE
+~
+```{r}
+summary(sample_sums(dist.field.git.ps))
+
+```
+
+  Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+  57003   96156  107779  104685  112126  139919 
+  
+```{r}
+#curve set up
+library(phyloseq)
+library(vegan)
+
+# OTU table: rarecurve() needs SAMPLES as rows
+field.otu <- as(otu_table(dist.field.git.ps), "matrix")
+if (taxa_are_rows(dist.field.git.ps)) field.otu <- t(field.otu)
+
+# metadata in the same sample order as the OTU table
+field.metadata <- data.frame(sample_data(dist.field.git.ps))[rownames(field.otu), ]
+stopifnot(identical(rownames(field.metadata), rownames(field.otu)))
+
+# colors by treatment
+treatment_colors <- c("ND" = "grey", "Few Small" = "orange",
+                      "Many Small" = "blue3",
+                      "HD" = "#984ea3")
+sample_colors <- unname(treatment_colors[as.character(field.metadata$Treatment)])
+```
+
+```{r}
+draw_rarecurve <- function() {
+  vegan::rarecurve(
+    field.otu,
+    step = 1000,
+    col = sample_colors,
+    lwd = 1.5,
+    label = FALSE,
+    xlab = "Sequencing depth (reads)",
+    ylab = "Observed ASV richness",
+    main = "Field rarefaction curves"
+  )
+  abline(v = 57003, col = "grey40", lty = 2)
+  legend("bottomright", legend = names(treatment_colors), col = treatment_colors,
+         lty = 1, lwd = 2, cex = 0.8, bty = "n", title = "Treatment")
+}
+
+# view in RStudio
+draw_rarecurve()
+
+# save to PDF
+pdf("Field_rarefaction_curves.pdf", width = 8, height = 6)
+draw_rarecurve()
+dev.off()
+```
+what sample has the lowest sequencing depth?
+lowest sequencing depth sample
+```{r}
+# Find sequencing depth for every Week 5 sample
+field.depth <- data.frame(
+  Sample = sample_names(dist.field.git.ps),
+  Sequencing_Depth = sample_sums(dist.field.git.ps)
+)
+# Sort from lowest to highest sequencing depth
+field.depth <- field.depth %>%
+  arrange(Sequencing_Depth)
+# Display all samples
+field.depth
+# Display the lowest-depth sample
+field.depth[1, ]
+View(field.metadata)
+```
+MM_Inield_6_	MM_Inield_6_	57003	
+many small rep^
+
+Rarefying - RAREFY @ at lowest depth
+~ first a single subsampling to a specific sequencing depth that computes a value for each ASV for each sample.
+~ second, a repeated rarefication loop (100 subsamples) at the lowest sequencing depth 
+```{r}
+rare.dist.field.git.ps <- rarefy_even_depth(
+  dist.field.git.ps,
+  sample.size = 57003,
+  rngseed = 123,
+  replace = FALSE,
+  trimOTUs = TRUE,
+  verbose = TRUE
+)
+#SAMPLE CHECK
+nsamples(rare.dist.field.git.ps)
+summary(sample_sums(rare.dist.field.git.ps))
+ntaxa(rare.dist.field.git.ps)
+
+#LOOP & alpha metrcis for the loop
+otu <- as(otu_table(dist.field.git.ps), "matrix")
+if (taxa_are_rows(dist.field.git.ps)) otu <- t(otu)      # samples x ASVs
+n_iter <- 100
+set.seed(123)
+sum_counts <- matrix(0, nrow(otu), ncol(otu), dimnames = dimnames(otu))
+alpha_arr  <- array(NA_real_, dim = c(nrow(otu), 3, n_iter),
+                    dimnames = list(rownames(otu),
+                                    c("Observed", "Shannon", "InvSimpson"), NULL))
+for (i in seq_len(n_iter)) {
+  r <- suppressWarnings(vegan::rrarefy(otu, sample = 57003))   # one rarefied draw
+  sum_counts <- sum_counts + r
+  alpha_arr[, "Observed",   i] <- rowSums(r > 0)
+  alpha_arr[, "Shannon",    i] <- vegan::diversity(r, "shannon")
+  alpha_arr[, "InvSimpson", i] <- vegan::diversity(r, "invsimpson")
+}
+# 1. averaged alpha table (one row per sample)
+alpha_rare2_avg <- as.data.frame(apply(alpha_arr, c(1, 2), mean))
+
+# 2. averaged-count phyloseq object (plots and descriptive summaries only)
+mean_counts <- sum_counts / n_iter
+rare.avg.dist.field.git.ps <- phyloseq(
+  otu_table(mean_counts, taxa_are_rows = FALSE),
+  sample_data(dist.field.git.ps),
+  tax_table(dist.field.git.ps)
+)
+rare.avg.dist.field.git.ps <- prune_taxa(
+  taxa_sums(rare.avg.dist.field.git.ps) > 0, rare.avg.dist.field.git.ps)
+
+#SAMPLE CHECK
+nsamples(rare.avg.dist.field.git.ps)
+summary(sample_sums(rare.avg.dist.field.git.ps))
+ntaxa(rare.avg.dist.field.git.ps)
+```
+[1] 19
+   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+  57003   57003   57003   57003   57003   57003 
+[1] 8496
+
+[1] 19
+   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+  57003   57003   57003   57003   57003   57003 
+[1] 8623
+
+~
+ALPHA DIVERSITY RESULTS (unrarefied data with rarefy checks!)
+~
+Making alpha dataframes for unrare and single rare  + adding in metadata
+```{r}
+make_alpha_df <- function(ps) {
+  alpha <- estimate_richness(ps, measures = c("Observed", "Shannon", "InvSimpson"))
+  alpha$Sample    <- sample_names(ps)            # avoids make.names() mangling
+  md              <- data.frame(sample_data(ps))
+  alpha$Treatment <- md[alpha$Sample, "Treatment"]
+  alpha$Depth     <- as.numeric(sample_sums(ps)[alpha$Sample])
+  alpha$Evenness  <- ifelse(alpha$Observed > 1, alpha$Shannon / log(alpha$Observed), NA)
+  rownames(alpha) <- alpha$Sample
+  alpha[, c("Sample","Treatment","Depth",
+            "Observed","Shannon","InvSimpson","Evenness")]
+}
+
+# 1. unrarefied
+alpha_unrare2 <- make_alpha_df(dist.field.git.ps)
+# 2. single-draw rarefied
+alpha_rare2_single <- make_alpha_df(rare.dist.field.git.ps)
+# 3. averaged over 100 draws (rebuilt from the field loop output)
+md <- data.frame(sample_data(dist.field.git.ps))
+alpha_rare2_avg <- as.data.frame(apply(alpha_arr, c(1, 2), mean))
+alpha_rare2_avg$Sample    <- rownames(alpha_rare2_avg)
+alpha_rare2_avg$Treatment <- md[alpha_rare2_avg$Sample, "Treatment"]
+alpha_rare2_avg$Depth     <- 57003
+alpha_rare2_avg$Evenness  <- ifelse(alpha_rare2_avg$Observed > 1,
+                                    alpha_rare2_avg$Shannon / log(alpha_rare2_avg$Observed), NA)
+alpha_rare2_avg <- alpha_rare2_avg[, names(alpha_unrare2)]   # same column order
+
+alpha_sets <- list(unrarefied  = alpha_unrare2,
+                   rare_avg    = alpha_rare2_avg,
+                   rare_single = alpha_rare2_single)
+
+# CHECK: no lost Treatment labels, 19 samples in each
+sapply(alpha_sets, function(d) c(n = nrow(d), NA_trt = sum(is.na(d$Treatment))))
+```
+
+```{r}
+dim(alpha_unrare2)                        # should be 27 rows, 3 columns
+head(alpha_unrare2)
+summary(alpha_unrare2)
+all(rownames(alpha_unrare2) == rownames(otu))   # TRUE: same sample order as the original table
+
+dim(alpha_rare2_single)                        # should be 27 rows, 3 columns
+head(alpha_rare2_single)
+summary(alpha_rare2_single)
+all(rownames(alpha_rare2_single) == rownames(otu))   # TRUE: same sample order as the original table
+
+dim(alpha_rare2_avg)                        # should be 27 rows, 3 columns
+head(alpha_rare2_avg)
+summary(alpha_rare2_avg)
+all(rownames(alpha_rare2_avg) == rownames(otu))   # TRUE: same sample order as the original table
+```
+looks good, now I have my alpha diversity table :)
+
+models! 1 way anovas unrare data
+- repeated with each alpha diversity metric (Shannon, Observed, Richness, Evenness)
+- models passed assumptions
+- no stat sig results
+```{r}
+# one-way ANOVA
+anova.unrare2 <- aov(
+  Evenness ~ Treatment ,
+  data = alpha_unrare2
+)
+summary(anova.unrare2)
+# Assumption checks
+qqnorm(residuals(anova.unrare2))
+qqline(residuals(anova.unrare2), col = "red")
+shapiro.test(residuals(anova.unrare2))
+leveneTest(
+  Evenness ~ Treatment ,
+  data = alpha_unrare2
+)
+par(mfrow = c(1, 2))
+plot(anova.unrare2, which = 1)   # residuals vs fitted: look for a funnel shape
+plot(anova.unrare2, which = 2)   # Q-Q plot
+par(mfrow = c(1, 1))
+
+#effect sizes. A p-value alone says little with n=3 per cell. This adds the share of variance each term explains:
+tab <- summary(anova.unrare2)[[1]]
+tab$eta_sq <- round(tab$`Sum Sq` / sum(tab$`Sum Sq`), 3)
+tab
+```
+models! 1 way anovas single rare data
+- repeated with each alpha diversity metric (Shannon, Observed, Richness, Evenness)
+- models passed assumptions
+- no stat sig results
+```{r}
+# one-way ANOVA
+anova.unrare2 <- aov(
+  Evenness ~ Treatment ,
+  data = alpha_rare2_single
+)
+summary(anova.unrare2)
+# Assumption checks
+qqnorm(residuals(anova.unrare2))
+qqline(residuals(anova.unrare2), col = "red")
+shapiro.test(residuals(anova.unrare2))
+leveneTest(
+  Evenness ~ Treatment ,
+  data = alpha_rare2_single
+)
+par(mfrow = c(1, 2))
+plot(anova.unrare2, which = 1)   # residuals vs fitted: look for a funnel shape
+plot(anova.unrare2, which = 2)   # Q-Q plot
+par(mfrow = c(1, 1))
+
+#effect sizes. A p-value alone says little with n=3 per cell. This adds the share of variance each term explains:
+tab <- summary(anova.unrare2)[[1]]
+tab$eta_sq <- round(tab$`Sum Sq` / sum(tab$`Sum Sq`), 3)
+tab
+```
+
+models! 1 way anovas repeated rare data
+- repeated with each alpha diversity metric (Shannon, Observed, Richness, Evenness)
+- models passed assumptions
+- no stat sig results
+```{r}
+# one-way ANOVA
+anova.unrare2 <- aov(
+  Observed ~ Treatment ,
+  data = alpha_rare2_avg
+)
+summary(anova.unrare2)
+# Assumption checks
+qqnorm(residuals(anova.unrare2))
+qqline(residuals(anova.unrare2), col = "red")
+shapiro.test(residuals(anova.unrare2))
+leveneTest(
+  Observed ~ Treatment ,
+  data = alpha_rare2_avg
+)
+par(mfrow = c(1, 2))
+plot(anova.unrare2, which = 1)   # residuals vs fitted: look for a funnel shape
+plot(anova.unrare2, which = 2)   # Q-Q plot
+par(mfrow = c(1, 1))
+
+#effect sizes. A p-value alone says little with n=3 per cell. This adds the share of variance each term explains:
+tab <- summary(anova.unrare2)[[1]]
+tab$eta_sq <- round(tab$`Sum Sq` / sum(tab$`Sum Sq`), 3)
+tab
+```
+
+CONCLUSIONS FROM ALPHA 
+Alpha diversity (Observed richness, Shannon, inverse Simpson, and Pielou’s evenness)
+- rarefied to 57,003 reads
+- rarefaction 100 times to 57,003
+- unrare data 
+- no difference!
+- Alpha Diversity did not differ detectably among disturbance treatments  (all p > 0.05; n = 4 or 5 per group)
+
+~~
+BETA DIVERISTY SET UP - FILTERING TYPES
+~~
+
+Type of Data & Filter Compared Here 
+1	Unrarefied (19 mats) - 	ASVs present in at least 3? mats
+2	Unrarefied (19 mats)	 - purgeOutliers ASV rules (otu.cut 0.0001, zero.cut 0.02), sample step off (sampleZcut = -100)
+3	Rarefied (100-draw average, 57,003 reads) - 	No filter
+
+*All three use CLR with a pseudocount of 1, then Euclidean distance (Aitchison).
+
+```{r}
+## ---------- 0. purgeOutliers: get it once, then load it locally ----------
+if (!file.exists("purgeOutliers.R")) {
+  tmp <- tempdir()
+  download.file("https://cran.r-project.org/src/contrib/Archive/MCMC.OTU/MCMC.OTU_1.0.10.tar.gz",
+                destfile = file.path(tmp, "MCMC.OTU.tar.gz"), mode = "wb")
+  untar(file.path(tmp, "MCMC.OTU.tar.gz"), exdir = tmp)
+  file.copy(file.path(tmp, "MCMC.OTU", "R", "purgeOutliers.R"), "purgeOutliers.R")
+}
+source("purgeOutliers.R")
+```
+
+
+```{r}
+## ---------- helper: quick summary of what a filter kept ----------
+filter_summary <- function(before, after) {
+  c(ASVs_before = ntaxa(before),
+    ASVs_after  = ntaxa(after),
+    samples     = nsamples(after),
+    pct_reads   = round(sum(taxa_sums(after)) /
+                        sum(taxa_sums(prune_samples(sample_names(after), before))) * 100, 2))
+}
+```
+
+
+```{r}
+## ---------- 1. MAIN: prevalence filter (ASV in >= 3 samples) ----------
+field.filt.ps <- filter_taxa(dist.field.git.ps, function(x) sum(x > 0) >= 3, prune = TRUE)
+```
+
+
+```{r}
+## ---------- 2. SENSITIVITY 1: purgeOutliers ASV rules ----------
+otu.mat <- as(otu_table(dist.field.git.ps), "matrix")
+if (taxa_are_rows(dist.field.git.ps)) otu.mat <- t(otu.mat)       # samples x ASVs
+
+seq.formcmc <- data.frame(X = seq_len(nrow(otu.mat)),
+                          sample = rownames(otu.mat),
+                          otu.mat, check.names = FALSE)
+
+seq.trim.allinfo <- purgeOutliers(seq.formcmc,
+                                  count.columns = 3:ncol(seq.formcmc),
+                                  sampleZcut = -100,          # keep all 19 mats (same as Summer)
+                                  otu.cut = 0.0001, zero.cut = 0.02)
+
+field.purged.ps <- prune_taxa(colnames(seq.trim.allinfo)[-(1:2)], dist.field.git.ps)
+field.purged.ps <- prune_samples(seq.trim.allinfo$sample, field.purged.ps)
+```
+
+
+```{r}
+## ---------- 3. SENSITIVITY 2: unfiltered, 100-draw averaged rarefied ----------
+field.rareavg.ps <- rare.avg.dist.field.git.ps     # already built in the rarefaction chunk
+```
+
+
+```{r}
+## ---------- CHECK all three ----------
+rbind(filtered = filter_summary(dist.field.git.ps, field.filt.ps),
+      purged   = filter_summary(dist.field.git.ps, field.purged.ps),
+      rare_avg = c(ntaxa(dist.field.git.ps), ntaxa(field.rareavg.ps),
+                   nsamples(field.rareavg.ps), NA))
+
+table(sample_data(field.purged.ps)$Treatment)       # should still be 5 / 4 / 5 / 5
+```
+            ASVs_before ASVs_after  samples  pct_reads (kept)
+filtered        8623       3838      19     95.91
+purged          8623       1540      19     87.46
+rare_avg        8623       8623      19        NA
+
+   ND  Few Small Many Small         HD 
+   5          4          5          5 
+
+~
+BETA DIVERSITY MODELS
+~
+
+Wrapped in function, so only have to run once - will give results for main model + sensitivity checks
+```{r}
+run_beta <- function(ps, n_perm = 9999) {
+  # ASV table (samples as rows) + matching metadata
+  otu <- as(otu_table(ps), "matrix")
+  if (taxa_are_rows(ps)) otu <- t(otu)
+  md <- data.frame(sample_data(ps))[rownames(otu), , drop = FALSE]
+
+  # CLR by hand (pseudocount 1) -> Euclidean = Aitchison distance
+  clr <- log(otu + 1)
+  clr <- clr - rowMeans(clr)
+  d   <- vegdist(clr, method = "euclidean")
+  stopifnot(identical(rownames(md), labels(d)))
+
+  # Dispersion by Treatment
+  set.seed(123)
+  disp <- betadisper(d, md$Treatment, bias.adjust = TRUE)
+
+  # One-way PERMANOVA
+  set.seed(123)
+  perm <- adonis2(d ~ Treatment, data = md, permutations = n_perm)
+
+  list(clr = clr, dist = d, md = md, betadisper = disp,
+       disp_anova = anova(disp),
+       disp_perm  = permutest(disp, pairwise = TRUE, permutations = n_perm),
+       permanova  = perm)
+}
+```
+
+main model
+- dispersion fine
+- treatment not sig 
+```{r}
+beta.filt <- run_beta(field.filt.ps)
+beta.filt$disp_perm      # dispersion: want p > 0.05
+beta.filt$permanova      # Treatment effect
+```
+adonis2(formula = d ~ Treatment, data = md, permutations = n_perm)
+          Df SumOfSqs      R2      F Pr(>F)
+Treatment  3    19605 0.18041 1.1006 0.2071
+Residual  15    89067 0.81959              
+Total     18   108672 1.00000           
+
+sensitivity model (purged)
+- dispersion fine
+- treatment not sig 
+```{r}
+beta.purged  <- run_beta(field.purged.ps)
+beta.purged$disp_perm      # dispersion: want p > 0.05
+beta.purged$permanova      # Treatment effect
+```
+adonis2(formula = d ~ Treatment, data = md, permutations = n_perm)
+          Df SumOfSqs      R2      F Pr(>F)
+Treatment  3    10172 0.18374 1.1255 0.1978
+Residual  15    45188 0.81626              
+Total     18    55359 1.00000              
+
+sensitivity model (repeated rare, no filter)
+- dispersion fine
+- treatment not sig 
+```{r}
+beta.rareavg <- run_beta(field.rareavg.ps)
+beta.rareavg$disp_perm      # dispersion: want p > 0.05
+beta.rareavg$permanova      # Treatment effect
+```
+adonis2(formula = d ~ Treatment, data = md, permutations = n_perm)
+          Df SumOfSqs     R2      F Pr(>F)
+Treatment  3    16941 0.1769 1.0746 0.2275
+Residual  15    78821 0.8231              
+Total     18    95761 1.0000   
+
+~
+Beta diversity results summary
+~
+*No sig differences in treatment
+*all models display similar, nonsignificant results
+
+~
+PCOA plot ~ for visualization
+~
+```{r}
+library(ggplot2)
+
+# ---------- PCoA of the prevalence-filtered CLR/Euclidean distances ----------
+stopifnot(ncol(beta.filt$clr) == ntaxa(field.filt.ps))    
+#confirms that the CLR table has the same number of ASVs as the prevalence-filtered object
+stopifnot(identical(rownames(beta.filt$md), labels(beta.filt$dist)))
+#confirms that the samples in the metadata are in exactly the same order as the samples in the distance matrix.
+
+field.pcoa <- ape::pcoa(beta.filt$dist)
+field.pcoa.percent <- round(field.pcoa$values$Relative_eig * 100, 1)
+field.pcoa.df <- cbind(
+  data.frame(PCoA1 = field.pcoa$vectors[, 1],
+             PCoA2 = field.pcoa$vectors[, 2]),
+  beta.filt$md
+)
+
+# colors matching the rarefaction curve
+treatment_colors <- c("ND" = "grey50", "Few Small" = "orange",
+                      "Many Small" = "blue3", "HD" = "#984ea3")
+
+# PERMANOVA label pulled from the results
+perm <- beta.filt$permanova
+perm_label <- sprintf("Treatment: R² = %.3f, p = %.3f", perm$R2[1], perm$`Pr(>F)`[1])
+
+# ---------- PCoA plot: Treatment ellipses + colored points ----------
+field.pcoa.plot <- ggplot(field.pcoa.df,
+                          aes(x = PCoA1, y = PCoA2, color = Treatment)) +
+  stat_ellipse(aes(group = Treatment, fill = Treatment),
+               geom = "polygon", level = 0.95,
+               alpha = 0.15, color = NA, show.legend = FALSE) +
+  geom_point(size = 3.5, alpha = 0.9) +
+  scale_color_manual(values = treatment_colors) +
+  scale_fill_manual(values = treatment_colors) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.05, vjust = 1.5, size = 3.5,
+           label = perm_label) +
+  labs(title = "Field ASV profiles: CLR/Euclidean PCoA",
+       x = paste0("PCoA 1 (", field.pcoa.percent[1], "%)"),
+       y = paste0("PCoA 2 (", field.pcoa.percent[2], "%)")) +
+  theme_classic(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 12))
+
+field.pcoa.plot
+#ggsave("Field_PCoA.pdf", field.pcoa.plot, width = 7, height = 5.5)
+```
+
+~
+DIFFERENTIAL ABUNDANCES
+~
+
+~
+DIFF ABUNDANCE RESULTS 
+~
+```{r}
+#levels(sample_data(dist.field.git.ps)$Treatment)   # ND should come first
+#primary 
+set.seed(123)
+ancom.treat2 <- ancombc2(
+  data = dist.field.git.ps, assay_name = NULL, tax_level = "Class",
+  fix_formula = "Treatment", rand_formula = NULL,
+  p_adj_method = "holm", pseudo_sens = TRUE,
+  prv_cut = 0.125, lib_cut = 0, s0_perc = 0.05,
+  group = "Treatment", struc_zero = FALSE, neg_lb = FALSE, alpha = 0.05,
+  global = TRUE, pairwise = TRUE, dunnet = TRUE, trend = FALSE,
+  n_cl = 6, verbose = TRUE)
+saveRDS(ancom.treat2, "ancom_field_treat_holm.rds")
+```
+
+to look at results
+```{r}
+res      <- ancom.treat2$res          # each treatment vs ND (main model)
+res_glob <- ancom.treat2$res_global   # any Treatment effect per Class
+res_pair <- ancom.treat2$res_pair     # all pairwise comparisons
+res_dunn <- ancom.treat2$res_dunn     # each treatment vs ND (Dunnett)
+sens     <- ancom.treat2$pseudo_sens_tab
+
+# Classes significant anywhere
+res_glob %>% filter(diff_abn) %>% arrange(q_val)
+res_dunn %>% filter(if_any(starts_with("diff_"), ~ .x))
+
+# top hits by raw p, even if not significant
+res_glob %>% arrange(p_val) %>% head(10)
+```
+which treatments differ?
+```{r}
+res_pair %>%
+  filter(taxon == "Class:Acetothermiia") %>%
+  select(starts_with("lfc_"), starts_with("q_"), starts_with("diff_")) %>%
+  pivot_longer(everything(),
+               names_to = c(".value", "comparison"),
+               names_pattern = "(lfc|q|diff)_(.*)")
+#checking sensitivity score
+sens %>%
+  pivot_longer(-taxon, names_to = "term", values_to = "sens_score") %>%
+  group_by(term) %>%
+  mutate(pct_rank = percent_rank(sens_score)) %>%
+  filter(taxon == "Class:Acetothermiia")
+```
+how many classes tested?
+```{r}
+nrow(ancom.treat2$res)
+```
+
+Acetothermiia
+
+
+```{r}
+acet <- class.all$sample_summary %>%
+  filter(Taxon_grouped == "Acetothermiia")
+
+# per treatment (fills the HD and Few Small blanks)
+acet %>%
+  group_by(Treatment) %>%
+  summarise(mean_pct  = mean(Relative_Abundance) * 100,
+            sd_pct    = sd(Relative_Abundance) * 100,
+            n_present = sum(Relative_Abundance > 0),
+            n_mats    = n())
+
+# across all 19 mats (fills the last blank)
+mean(acet$Relative_Abundance) * 100
+```
+
+~
+COMBINE PLOTS
+~
+```{r}
+library(cowplot)
+field.combo <- plot_grid(
+  class.rare$plot + labs(title = NULL),
+  field.pcoa.plot + labs(title = NULL),
+  labels = c("A", "B"), label_size = 14,
+  nrow = 1, rel_widths = c(1.3, 1),
+  align = "h", axis = "tb"
+)
+
+field.combo
+ggsave("Field_PCoA_ClassBar2.pdf", field.combo, width = 10, height = 6)
+```
+
+PAM
+Field PAM, just a baseline, looked at internal vs external samples (no between treatments)
+~no differences seen
+```{r}
+View(fieldpam)
+fieldpam$Treatment <- as.character(fieldpam$Treatment)
+fieldpam_model <- aov(pam ~ Treatment, data = fieldpam)
+summary(fieldpam_model)
+
+#checkassumptions
+#(1)normality
+qqnorm(residuals(fieldpam_model))
+qqline(residuals(fieldpam_model), col = "red")
+shapiro_test <- shapiro.test(residuals(fieldpam_model))
+print(shapiro_test)
+#(2)homogeneity
+levene_test <- leveneTest(pam ~ Treatment, data = fieldpam)
+print(levene_test)
+```
